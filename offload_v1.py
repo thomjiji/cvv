@@ -1,24 +1,28 @@
 import argparse
 import contextlib
 from pathlib import Path
+from string import printable
 
 import xxhash
 
 
-def calculate_hash(file_path: Path, chunk_size=8192):
+def calculate_hash(file_path: Path, chunk_size: int = 8192):
     """Calculates and returns the xxhash64 checksum of a file."""
     h = xxhash.xxh64()
     try:
         with file_path.open("rb") as f:
             while chunk := f.read(chunk_size):
                 h.update(chunk)
+                print(h.hexdigest())
         return h.hexdigest()
     except OSError as e:
         print(f"Error calculating hash for {file_path}: {e}")
         return None
 
 
-def secure_copy_file(src: Path, dsts: list[Path], verify_source: bool, chunk_size=8192):
+def secure_copy_file(
+    src: Path, dsts: list[Path], verify_source: bool, chunk_size: int = 8192
+):
     """
     Securely copies a file to multiple destinations, reading the source only once.
     """
