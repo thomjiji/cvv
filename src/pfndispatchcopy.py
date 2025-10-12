@@ -345,6 +345,7 @@ class ParallelWriter:
         destinations: list[Path],
         temp_files: dict[Path, Path],
         progress_tracker: ProgressTracker,
+        hash_algorithm: str | None = None,
     ) -> None:
         """
         Initialize parallel writer.
@@ -357,6 +358,8 @@ class ParallelWriter:
             Mapping of destinations to temporary files
         progress_tracker : ProgressTracker
             Progress tracking instance
+        hash_algorithm : str | None
+            Hash algorithm to use for calculating hash during read
         """
         self.destinations = destinations
         self.temp_files = temp_files
@@ -367,6 +370,25 @@ class ParallelWriter:
         self.chunks_written = {dest: 0 for dest in destinations}
         self.total_bytes_written = 0
         self.write_lock = threading.Lock()
+
+        # Initialize hash calculator if requested
+        self.hash_algorithm = hash_algorithm
+        self.hasher = None
+        if hash_algorithm:
+            if hash_algorithm.lower() == "xxh64be":
+                if not has_xxhash:
+                    raise ValueError(
+                        "xxhash library not available. Install with: pip install xxhash"
+                    )
+                self.hasher = xxhash.xxh64()
+            elif hash_algorithm.lower() == "md5":
+                self.hasher = hashlib.md5()
+            elif hash_algorithm.lower() == "sha1":
+                self.hasher = hashlib.sha1()
+            elif hash_algorithm.lower() == "sha256":
+                self.hasher = hashlib.sha256()
+            else:
+                raise ValueError(f"Unsupported hash algorithm: {hash_algorithm}")
 
     def open_files(self) -> None:
         """Open all destination files for writing."""
@@ -431,7 +453,11 @@ class ParallelWriter:
         return threads
 
     def distribute_chunk(self, chunk: ChunkData) -> None:
-        """Distribute a chunk to all writer queues."""
+        """Distribute a chunk to all writer queues and update hash if enabled."""
+        # Update hash with this chunk
+        if self.hasher is not None:
+            self.hasher.update(chunk.data)
+
         for dest in self.destinations:
             self.chunk_queues[dest].put(chunk)
 
@@ -444,6 +470,19 @@ class ParallelWriter:
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
+
+    def get_hash(self) -> str | None:
+        """
+        Get the calculated hash digest.
+
+        Returns
+        -------
+        str | None
+            Hexadecimal hash digest, or None if no hash was calculated
+        """
+        if self.hasher is not None:
+            return self.hasher.hexdigest()
+        return None
 
 
 def copy_with_source_verification(
@@ -845,7 +884,7 @@ class PSTaskWrapper:
             # Summary
             summary = self.source_verifier.get_summary()
             logging.info("")
-            logging.info(f"Source verification summary:")
+            logging.info("Source verification summary:")
             logging.info(f"  Verified: {summary['verified']}")
             logging.info(f"  Failed: {summary['failed']}")
             logging.info(f"  Pending: {summary['pending']}")
@@ -998,7 +1037,7 @@ def copy_file_to_destination(
 
         # Verify file size
         if temp_file.stat().st_size != source.stat().st_size:
-            raise IOError(f"File size mismatch for {destination}")
+            raise OSError(f"File size mismatch for {destination}")
 
         # Flush to disk if not disabled
         if not noflush:
@@ -1016,7 +1055,7 @@ def copy_file_to_destination(
         # Clean up temp file on error
         if temp_file.exists():
             temp_file.unlink()
-        raise IOError(f"Failed to copy to {destination}: {e}")
+        raise OSError(f"Failed to copy to {destination}: {e}")
 
 
 def copy_with_multiple_destinations_parallel(
@@ -1092,7 +1131,9 @@ def copy_with_multiple_destinations_parallel(
             temp_files[dest] = temp_file
 
         # Initialize parallel writer
-        parallel_writer = ParallelWriter(destinations, temp_files, progress_tracker)
+        parallel_writer = ParallelWriter(
+            destinations, temp_files, progress_tracker, hash_algorithm
+        )
         parallel_writer.open_files()
 
         try:
@@ -1156,12 +1197,12 @@ def copy_with_multiple_destinations_parallel(
             f"copy speed {actual_size} bytes in {duration:.5f} sec ({speed:.1f} MB/sec)"
         )
 
-        # Calculate hash if requested
+        # Get hash if it was calculated during reading
         if hash_algorithm:
-            hash_calc = HashCalculator(hash_algorithm)
-            file_hash = hash_calc.calculate(source, buffer_size)
-            logging.info(f"hash {hash_algorithm.upper()}:{file_hash}")
-            results["hash"] = file_hash
+            file_hash = parallel_writer.get_hash()
+            if file_hash:
+                logging.info(f"hash {hash_algorithm.upper()}:{file_hash}")
+                results["hash"] = file_hash
 
         logging.info("moving files in place..")
         logging.info("flushing files")
@@ -1174,7 +1215,7 @@ def copy_with_multiple_destinations_parallel(
         for temp_file in temp_files.values():
             if temp_file.exists():
                 temp_file.unlink()
-        raise IOError(f"Copy operation failed: {e}")
+        raise OSError(f"Copy operation failed: {e}")
 
 
 def copy_with_multiple_destinations(
@@ -1332,7 +1373,7 @@ def copy_with_multiple_destinations(
             if not handle.closed:
                 handle.close()
 
-        raise IOError(f"Copy operation failed: {e}")
+        raise OSError(f"Copy operation failed: {e}")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -1527,7 +1568,7 @@ def main() -> int:
     except ValueError as e:
         logging.error(f"Invalid parameter: {e}")
         return 1
-    except IOError as e:
+    except OSError as e:
         logging.error(f"I/O error: {e}")
         return 1
     except Exception as e:
