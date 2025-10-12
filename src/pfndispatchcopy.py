@@ -11,16 +11,12 @@ import argparse
 import hashlib
 import logging
 import os
-import shutil
-import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 import sys
 import queue
-import threading
 
 try:
     import xxhash
@@ -276,6 +272,330 @@ class ParallelWriter:
             thread.join()
 
 
+class PSTaskWrapper:
+    """
+    Wrapper class that handles both file and directory copying operations.
+
+    This class mimics the behavior of Offload Manager's PSTaskWrapper,
+    providing unified interface for copying single files or entire directory trees
+    to multiple destinations while preserving directory structure.
+    """
+
+    def __init__(self, verbose: bool = False) -> None:
+        """
+        Initialize PSTaskWrapper.
+
+        Parameters
+        ----------
+        verbose : bool
+            Enable verbose logging
+        """
+        self.verbose = verbose
+        self.total_files = 0
+        self.completed_files = 0
+        self.failed_files = 0
+        self.total_bytes = 0
+        self.copied_bytes = 0
+
+    def discover_files(self, source_path: Path) -> List[Path]:
+        """
+        Discover all files in source path (file or directory).
+
+        Parameters
+        ----------
+        source_path : Path
+            Source file or directory path
+
+        Returns
+        -------
+        List[Path]
+            List of all files to be copied
+        """
+        if source_path.is_file():
+            return [source_path]
+        elif source_path.is_dir():
+            files = []
+            for item in source_path.rglob("*"):
+                if item.is_file():
+                    files.append(item)
+            return files
+        else:
+            raise FileNotFoundError(f"Source path does not exist: {source_path}")
+
+    def calculate_relative_path(self, file_path: Path, source_root: Path) -> Path:
+        """
+        Calculate relative path from source root.
+
+        Parameters
+        ----------
+        file_path : Path
+            Absolute path to file
+        source_root : Path
+            Source root directory
+
+        Returns
+        -------
+        Path
+            Relative path from source root
+        """
+        if source_root.is_file():
+            return file_path.name
+        else:
+            return file_path.relative_to(source_root)
+
+    def map_destinations(
+        self, source_file: Path, source_root: Path, destination_roots: List[Path]
+    ) -> List[Path]:
+        """
+        Map source file to corresponding destination paths.
+
+        Parameters
+        ----------
+        source_file : Path
+            Source file path
+        source_root : Path
+            Source root path (file or directory)
+        destination_roots : List[Path]
+            List of destination root paths
+
+        Returns
+        -------
+        List[Path]
+            List of mapped destination file paths
+        """
+        relative_path = self.calculate_relative_path(source_file, source_root)
+        destinations = []
+
+        for dest_root in destination_roots:
+            if source_root.is_file():
+                # For single file, destination should be the target file
+                destinations.append(dest_root)
+            else:
+                # For directory, append relative path to destination root
+                destinations.append(dest_root / relative_path)
+
+        return destinations
+
+    def copy_directory_structure(
+        self,
+        source: Path,
+        destinations: List[Path],
+        buffer_size: int = 8388608,
+        expected_size: Optional[int] = None,
+        noflush_destinations: List[Path] = None,
+        hash_algorithm: Optional[str] = None,
+        keep_source: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Copy entire directory structure to multiple destinations.
+
+        Parameters
+        ----------
+        source : Path
+            Source directory path
+        destinations : List[Path]
+            List of destination directory paths
+        buffer_size : int
+            Buffer size for copying operations
+        expected_size : Optional[int]
+            Expected total size for verification (optional for directories)
+        noflush_destinations : List[Path], optional
+            Destinations to skip flushing for
+        hash_algorithm : Optional[str]
+            Hash algorithm for verification
+        keep_source : bool
+            Whether to keep source after copying
+
+        Returns
+        -------
+        Dict[str, Any]
+            Copy results including statistics and success status
+        """
+        if noflush_destinations is None:
+            noflush_destinations = []
+
+        logging.info(f"PSTaskWrapper launching directory copy from {source}")
+
+        # Discover all files in source
+        source_files = self.discover_files(source)
+        self.total_files = len(source_files)
+
+        if self.total_files == 0:
+            logging.warning(f"No files found in source: {source}")
+            return {"success": True, "files_copied": 0, "files_failed": 0}
+
+        logging.info(f"Found {self.total_files} files to copy")
+
+        # Calculate total size
+        self.total_bytes = sum(f.stat().st_size for f in source_files)
+        if expected_size and self.total_bytes != expected_size:
+            logging.warning(
+                f"Size mismatch: expected {expected_size}, found {self.total_bytes}"
+            )
+
+        results = {
+            "success": True,
+            "files_copied": 0,
+            "files_failed": 0,
+            "total_files": self.total_files,
+            "total_bytes": self.total_bytes,
+            "file_results": {},
+        }
+
+        # Process each file
+        for source_file in source_files:
+            try:
+                # Map to destination paths
+                dest_files = self.map_destinations(source_file, source, destinations)
+
+                # Determine which destinations should skip flush
+                noflush_for_file = []
+                for dest_file in dest_files:
+                    for noflush_dest in noflush_destinations:
+                        if dest_file == noflush_dest or dest_file.is_relative_to(
+                            noflush_dest
+                        ):
+                            noflush_for_file.append(dest_file)
+                            break
+
+                # Copy file to all destinations
+                if len(dest_files) > 1:
+                    file_result = copy_with_multiple_destinations_parallel(
+                        source=source_file,
+                        destinations=dest_files,
+                        buffer_size=buffer_size,
+                        noflush_destinations=noflush_for_file,
+                        hash_algorithm=hash_algorithm,
+                        keep_source=keep_source,
+                    )
+                else:
+                    file_result = copy_with_multiple_destinations(
+                        source=source_file,
+                        destinations=dest_files,
+                        buffer_size=buffer_size,
+                        noflush_destinations=noflush_for_file,
+                        hash_algorithm=hash_algorithm,
+                        keep_source=keep_source,
+                    )
+
+                if file_result["success"]:
+                    self.completed_files += 1
+                    results["files_copied"] += 1
+                    logging.info(
+                        f"✓ Copied {source_file.name} ({self.completed_files}/{self.total_files})"
+                    )
+                else:
+                    self.failed_files += 1
+                    results["files_failed"] += 1
+                    results["success"] = False
+                    logging.error(f"✗ Failed {source_file.name}")
+
+                results["file_results"][str(source_file)] = file_result
+
+            except Exception as e:
+                self.failed_files += 1
+                results["files_failed"] += 1
+                results["success"] = False
+                results["file_results"][str(source_file)] = {
+                    "success": False,
+                    "error": str(e),
+                }
+                logging.error(f"✗ Error copying {source_file}: {e}")
+
+        # Final statistics
+        success_rate = (
+            (self.completed_files / self.total_files * 100)
+            if self.total_files > 0
+            else 0
+        )
+
+        logging.info(
+            f"Directory copy completed: {self.completed_files}/{self.total_files} files ({success_rate:.1f}%)"
+        )
+
+        if self.failed_files > 0:
+            logging.warning(f"Failed files: {self.failed_files}")
+            results["success"] = False
+
+        return results
+
+    def launch_copy(
+        self,
+        source: Union[Path, str],
+        destinations: Union[List[Path], List[str]],
+        buffer_size: int = 8388608,
+        expected_size: Optional[int] = None,
+        noflush_destinations: Optional[List[Union[Path, str]]] = None,
+        hash_algorithm: Optional[str] = None,
+        keep_source: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Launch copy operation for file or directory.
+
+        Parameters
+        ----------
+        source : Union[Path, str]
+            Source file or directory path
+        destinations : Union[List[Path], List[str]]
+            List of destination paths
+        buffer_size : int
+            Buffer size for copying operations
+        expected_size : Optional[int]
+            Expected file/directory size for verification
+        noflush_destinations : Optional[List[Union[Path, str]]]
+            Destinations to skip flushing for
+        hash_algorithm : Optional[str]
+            Hash algorithm for verification
+        keep_source : bool
+            Whether to keep source after copying
+
+        Returns
+        -------
+        Dict[str, Any]
+            Copy results
+        """
+        # Convert to Path objects
+        source_path = Path(source)
+        dest_paths = [Path(dest) for dest in destinations]
+        noflush_paths = [Path(dest) for dest in (noflush_destinations or [])]
+
+        if source_path.is_file():
+            # Single file copy
+            if len(dest_paths) > 1:
+                return copy_with_multiple_destinations_parallel(
+                    source=source_path,
+                    destinations=dest_paths,
+                    buffer_size=buffer_size,
+                    expected_size=expected_size,
+                    noflush_destinations=noflush_paths,
+                    hash_algorithm=hash_algorithm,
+                    keep_source=keep_source,
+                )
+            else:
+                return copy_with_multiple_destinations(
+                    source=source_path,
+                    destinations=dest_paths,
+                    buffer_size=buffer_size,
+                    expected_size=expected_size,
+                    noflush_destinations=noflush_paths,
+                    hash_algorithm=hash_algorithm,
+                    keep_source=keep_source,
+                )
+        elif source_path.is_dir():
+            # Directory copy
+            return self.copy_directory_structure(
+                source=source_path,
+                destinations=dest_paths,
+                buffer_size=buffer_size,
+                expected_size=expected_size,
+                noflush_destinations=noflush_paths,
+                hash_algorithm=hash_algorithm,
+                keep_source=keep_source,
+            )
+        else:
+            raise FileNotFoundError(f"Source path does not exist: {source_path}")
+
+
 def copy_file_to_destination(
     source: Path,
     destination: Path,
@@ -459,7 +779,7 @@ def copy_with_multiple_destinations_parallel(
             # Verify file size
             if temp_file.stat().st_size != actual_size:
                 results["success"] = False
-                results["destinations"][str(dest)] = f"File size mismatch"
+                results["destinations"][str(dest)] = "File size mismatch"
                 continue
 
             # Flush if not disabled
@@ -611,7 +931,7 @@ def copy_with_multiple_destinations(
             # Verify file size
             if temp_file.stat().st_size != actual_size:
                 results["success"] = False
-                results["destinations"][str(dest)] = f"File size mismatch"
+                results["destinations"][str(dest)] = "File size mismatch"
                 continue
 
             # Flush if not disabled
@@ -750,12 +1070,12 @@ Examples:
         help="Destination path to skip flushing (can be used multiple times)",
     )
 
-    # Source file (required)
-    parser.add_argument("source", type=Path, help="Source file path")
+    # Source file or directory (required)
+    parser.add_argument("source", type=Path, help="Source file or directory path")
 
-    # Destination files (one or more required)
+    # Destination files or directories (one or more required)
     parser.add_argument(
-        "destinations", nargs="+", type=Path, help="Destination file paths"
+        "destinations", nargs="+", type=Path, help="Destination file or directory paths"
     )
 
     return parser.parse_args()
@@ -781,8 +1101,10 @@ def main() -> int:
         if args.noflush_destinations:
             noflush_destinations = [Path(dest) for dest in args.noflush_destinations]
 
-        # Perform copy operation (automatically uses parallel implementation for multiple destinations)
-        results = copy_with_multiple_destinations(
+        # Use PSTaskWrapper for unified file/directory handling
+        task_wrapper = PSTaskWrapper(verbose=args.verbose)
+
+        results = task_wrapper.launch_copy(
             source=args.source,
             destinations=args.destinations,
             buffer_size=args.buffer_size,
@@ -793,13 +1115,27 @@ def main() -> int:
         )
 
         if results["success"]:
-            logging.info("All copy operations completed successfully")
+            if "files_copied" in results:
+                # Directory copy results
+                logging.info(
+                    f"All copy operations completed successfully ({results['files_copied']} files)"
+                )
+            else:
+                # File copy results
+                logging.info("All copy operations completed successfully")
             return 0
         else:
-            logging.error("Some copy operations failed")
-            for dest, status in results["destinations"].items():
-                if status != "success":
-                    logging.error(f"Failed: {dest} - {status}")
+            if "files_failed" in results:
+                # Directory copy results
+                logging.error(
+                    f"Some copy operations failed ({results['files_failed']} failures)"
+                )
+            else:
+                # File copy results
+                logging.error("Some copy operations failed")
+                for dest, status in results.get("destinations", {}).items():
+                    if status != "success":
+                        logging.error(f"Failed: {dest} - {status}")
             return 1
 
     except KeyboardInterrupt:

@@ -2,8 +2,8 @@
 """
 Quick demonstration of pfndispatchcopy functionality.
 
-This script creates sample files and demonstrates the core features
-of the pfndispatchcopy tool in a simple, easy-to-understand way.
+This script creates sample files and directories and demonstrates the core features
+of the pfndispatchcopy tool including both file and directory copying capabilities.
 """
 
 import logging
@@ -16,7 +16,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Import our pfndispatchcopy functions
-from pfndispatchcopy import copy_with_multiple_destinations, setup_logging
+from pfndispatchcopy import (
+    copy_with_multiple_destinations,
+    PSTaskWrapper,
+    setup_logging,
+)
 
 
 def create_demo_file(
@@ -169,6 +173,93 @@ def demo_integrity_verification() -> None:
                 print(f"  {hash_algo.upper():>6}: Failed")
 
 
+def demo_directory_copying() -> None:
+    """Demonstrate directory structure copying capabilities."""
+    print("\n" + "=" * 50)
+    print("📁 DEMO: Directory Structure Copying")
+    print("=" * 50)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+
+        # Create test directory structure
+        source_dir = temp_path / "project_source"
+        dirs_to_create = [
+            "video/raw",
+            "video/edited",
+            "audio/original",
+            "docs/scripts",
+            "assets/images",
+        ]
+
+        for dir_path in dirs_to_create:
+            (source_dir / dir_path).mkdir(parents=True, exist_ok=True)
+
+        # Create test files
+        test_files = [
+            ("video/raw/clip001.mov", "Raw video clip 001 data" * 200),
+            ("video/edited/final.mp4", "Final edited video" * 300),
+            ("audio/original/sound.wav", "Audio track data" * 250),
+            ("docs/scripts/script.txt", "Video script content" * 100),
+            ("assets/images/logo.png", "PNG image data" * 150),
+            ("project_info.json", '{"name": "Test Project", "version": "1.0"}'),
+        ]
+
+        for file_path, content in test_files:
+            full_path = source_dir / file_path
+            full_path.write_text(content)
+
+        print(f"📂 Created directory structure with {len(test_files)} files")
+
+        # Create multiple destination directories
+        destinations = [
+            temp_path / "backup_drive_1",
+            temp_path / "backup_drive_2",
+            temp_path / "archive_storage",
+        ]
+
+        print(f"🎯 Copying directory to {len(destinations)} destinations...")
+
+        # Use PSTaskWrapper for directory copying
+        task_wrapper = PSTaskWrapper(verbose=False)  # Less verbose for demo
+
+        try:
+            result = task_wrapper.launch_copy(
+                source=source_dir,
+                destinations=destinations,
+                buffer_size=128 * 1024,  # 128KB buffer
+                hash_algorithm="md5",
+            )
+
+            if result["success"]:
+                print(f"✅ Directory copy completed!")
+                print(f"   Files copied: {result['files_copied']}")
+                print(f"   Total bytes: {result['total_bytes']:,}")
+
+                # Verify one destination
+                dest_to_check = destinations[0]
+                if dest_to_check.exists():
+                    # Count files in destination
+                    dest_files = list(dest_to_check.rglob("*"))
+                    file_count = len([f for f in dest_files if f.is_file()])
+                    print(f"   Verified {file_count} files in {dest_to_check.name}")
+
+                    # Show directory structure
+                    print(f"\n📋 Directory structure preserved:")
+                    for file_path in sorted([f for f in dest_files if f.is_file()]):
+                        rel_path = file_path.relative_to(dest_to_check)
+                        print(f"   📄 {rel_path}")
+                else:
+                    print("❌ Destination verification failed")
+            else:
+                print(
+                    f"❌ Directory copy failed: {result.get('files_failed', 0)} failures"
+                )
+
+        except Exception as e:
+            print(f"❌ Directory copy error: {e}")
+
+
 def demo_error_handling() -> None:
     """Demonstrate error handling capabilities."""
     print("\n" + "=" * 50)
@@ -220,10 +311,18 @@ def main() -> None:
         demo_basic_copy()
         demo_performance_comparison()
         demo_integrity_verification()
+        demo_directory_copying()
         demo_error_handling()
 
         print("\n" + "=" * 60)
         print("🎉 All demonstrations completed successfully!")
+        print("📚 Key features demonstrated:")
+        print("   • Single file to multiple destinations")
+        print("   • Performance optimization with different buffer sizes")
+        print("   • Hash verification with multiple algorithms")
+        print("   • Directory structure copying with preserved hierarchy")
+        print("   • Error handling and validation")
+        print("")
         print("📚 See README.md for detailed usage instructions")
         print("🧪 Run 'python3 example_usage.py' for more comprehensive examples")
 

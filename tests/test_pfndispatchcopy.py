@@ -16,7 +16,6 @@ from unittest.mock import patch
 
 # Import the modules we want to test
 import sys
-from pathlib import Path
 
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
