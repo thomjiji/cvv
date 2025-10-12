@@ -29,7 +29,7 @@ except ImportError:
 class ProgressTracker:
     """Track and report copy progress across multiple threads."""
 
-    def __init__(self, total_size: int, update_interval: float = 0.5) -> None:
+    def __init__(self, total_size: int, update_interval: float = 2.0) -> None:
         """
         Initialize progress tracker.
 
@@ -45,6 +45,10 @@ class ProgressTracker:
         self.bytes_copied = 0
         self.start_time = time.time()
         self.last_update = 0
+        self.last_percentage = 0
+        self.min_bytes_threshold = max(
+            1024 * 1024 * 10, total_size // 50
+        )  # 10MB or 2% of file
         self.lock = threading.Lock()
 
     def update(self, bytes_copied: int) -> None:
@@ -59,10 +63,26 @@ class ProgressTracker:
         with self.lock:
             self.bytes_copied = bytes_copied
             current_time = time.time()
+            current_percentage = (
+                (bytes_copied / self.total_size * 100) if self.total_size > 0 else 0
+            )
 
-            if current_time - self.last_update >= self.update_interval:
-                logging.info(f"copied {bytes_copied} of {self.total_size} bytes")
+            # Update if enough time has passed AND (enough bytes copied OR significant percentage change)
+            time_threshold = current_time - self.last_update >= self.update_interval
+            bytes_threshold = (
+                bytes_copied - (self.total_size * self.last_percentage / 100)
+                >= self.min_bytes_threshold
+            )
+            percentage_threshold = (
+                current_percentage - self.last_percentage >= 5
+            )  # Every 5%
+
+            if time_threshold and (bytes_threshold or percentage_threshold):
+                logging.info(
+                    f"copied {bytes_copied:,} of {self.total_size:,} bytes ({current_percentage:.1f}%)"
+                )
                 self.last_update = current_time
+                self.last_percentage = current_percentage
 
     def get_stats(self) -> Tuple[float, float]:
         """
