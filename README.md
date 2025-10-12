@@ -250,6 +250,8 @@ The project follows Python best practices:
 - **Docstrings**: NumPy-style documentation
 - **Error handling**: Comprehensive exception handling
 - **Logging**: Professional-grade logging throughout
+- **Code formatting**: Uses Ruff, Black, and isort for consistent code style
+- **Linting**: Uses Ruff, flake8, and mypy for code quality checks
 
 ### Testing
 

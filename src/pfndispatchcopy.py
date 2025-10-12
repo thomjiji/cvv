@@ -21,9 +21,9 @@ from typing import Any
 try:
     import xxhash
 
-    HAS_XXHASH = True
+    has_xxhash = True
 except ImportError:
-    HAS_XXHASH = False
+    has_xxhash = False
 
 
 class ProgressTracker:
@@ -119,7 +119,7 @@ class HashCalculator:
         """
         self.algorithm = algorithm.lower()
 
-        if self.algorithm == "xxh64be" and not HAS_XXHASH:
+        if self.algorithm == "xxh64be" and not has_xxhash:
             raise ValueError(
                 "xxhash library not available. Install with: pip install xxhash"
             )
@@ -752,7 +752,7 @@ def copy_with_multiple_destinations_parallel(
 
     try:
         # Create temporary files for all destinations
-        temp_files = {}
+        temp_files: dict[Path, Path] = {}
         for dest in destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
             temp_file = dest.parent / f".{dest.name}.tmp"

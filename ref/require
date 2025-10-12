@@ -1,0 +1,51 @@
+When copying camera footage, most operators are familiar with the importance of verifying a good copy. ‘Verifying’ in this case usually refers to verifying the destination, e.g. making sure that the copied file at its destination is the same as on the source location. However, another possible process is often not mentioned in that context – and that is the source verification.
+
+In this article we want to make you more familiar with the idea behind source verification, explain why it’s so important on set, and show how this looks like if you’re working in Silverstack.
+
+### Source verification vs destination verification
+
+To dive into this topic we first have to make a short leap into the basic concept of copying digital media files:
+
+Generally when you securely want to copy a digital file the following steps should be performed:
+
+- **First:** A checksum is created while reading the source file. This checksum is stored.
+- **Second:** After the (hopefully identical) destination file is written, the destination file is read again and its checksum (also called hash) is created.
+- **Third:** The two checksums are compared. If they are identical you can be sure the files on source and destination are also identical.
+
+This process can be referred to as the verification of the destination file. It is the basic concept that happens when you copy with a proper copy tool like Silverstack.
+
+But what does the verification in this case tell us? It “just” confirms that the destination is identical to the source. But what if the source is somehow damaged, e.g. because something is wrong with the card or reader? That’s where the source verification comes into play.
+
+### Source verification explained
+
+#### The idea behind source verification
+
+The idea behind source verification is to check back about the integrity of a file on the source card after the copy process. As explained before, the “standard” secure copy process can only make sure that the copied destination file is identical to the file that was read from the source card. So by checking back again if the file on the source card is still identical at a later point in time, the whole integrity of the copy process is ensured.
+
+Taking a technical look at it, this means that additionally to the destination verification, the source file is read a second time to create its hash again. That new hash can now also be compared to the initial hash, to learn if the source file is identical at two different points in time.
+
+So now three checksums are created, which should be identical for the integrity of the whole copy process: The initial hash of the source file, the hash of the destination file once written, and the second hash of the source file at a later point in time.
+
+#### History of source verification
+
+At a first thought it seems not very likely that the file on the source card would change over time. However, there are cases of this happening, which led to the implementation of the source verification as it exists today.
+
+Let me give you a bit of history:
+
+Back in the days of the RED One camera (around 10 year ago) and the early days of Silverstack there have been problems with some of the first cards (mags) from those particular cameras. Those mags failed to produce consistent read results after a specific time of reuse cycles, which means that clips could get corrupted when the card was used for a certain amount of write cycles.
+
+While this was only the fact for a certain, very earlyrange of cards, and RED does not have those issues anymore, at that time this phenomenon triggered the implementation of the source verification in Silverstack – basically to be able to detect similar problems in the future, such as identifying“dying” or bad cards, or card readers with issues.
+
+Just to make you understand that nonetheless this still has relevance today: In the Pomfort support we had more recent cases where the source verification helped to identify problems with a recent source media system.
+
+#### Why is source verification particularly important on set?
+
+As there usually is a limited set of source cards that are used on a movie shoot, a single bad card can introduce many problems. As the cards are reused in cycles, a damaged card is potentially used again if not identified and sorted out.
+
+By identifying problems with the copy source, the source verification adds another layer of security to the copy process. Of course the destination verification is still the most important, as it makes sure that the destination files are identical. However, the source verification helps to identify if problems with the source lead to a false positive of the destination verification.
+
+---
+
+Source & Destination
+
+All sources and destinations are independently verified for maximum protection by reading back everything and comparing the resulting checksums and file metadata. Typically, it takes twice as long as Transfer Verification.

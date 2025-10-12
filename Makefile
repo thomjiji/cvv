@@ -17,8 +17,8 @@ help:
 	@echo "  install-dev   Install package with development dependencies"
 	@echo "  test          Run unit tests"
 	@echo "  test-cov      Run tests with coverage report"
-	@echo "  lint          Run code linting (flake8, mypy)"
-	@echo "  format        Format code with black and isort"
+	@echo "  lint          Run code linting (flake8, mypy, ruff)"
+	@echo "  format        Format code with black, isort, and ruff"
 	@echo "  check         Run all code quality checks"
 	@echo "  demo          Run quick demonstration"
 	@echo "  examples      Run comprehensive examples"
@@ -65,6 +65,8 @@ lint:
 	@echo "🔍 Running code linting..."
 	@echo "  → flake8..."
 	flake8 src/ tests/ examples/
+	@echo "  → ruff..."
+	ruff check src/ tests/ examples/
 	@echo "  → mypy..."
 	mypy src/
 	@echo "✅ Linting passed"
@@ -76,6 +78,8 @@ format:
 	black src/ tests/ examples/
 	@echo "  → isort..."
 	isort src/ tests/ examples/
+	@echo "  → ruff..."
+	ruff check --fix src/ tests/ examples/
 	@echo "✅ Code formatted"
 
 # Run all code quality checks
