@@ -6,7 +6,6 @@ This script creates sample files and directories and demonstrates the core featu
 of the pfndispatchcopy tool including both file and directory copying capabilities.
 """
 
-import logging
 import sys
 import tempfile
 import time
@@ -17,9 +16,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Import our pfndispatchcopy functions
 from pfndispatchcopy import (
-    copy_with_multiple_destinations,
     PSTaskWrapper,
     VerificationMode,
+    copy_with_multiple_destinations,
     setup_logging,
 )
 
@@ -233,7 +232,7 @@ def demo_directory_copying() -> None:
             )
 
             if result["success"]:
-                print(f"✅ Directory copy completed!")
+                print("✅ Directory copy completed!")
                 print(f"   Files copied: {result['files_copied']}")
                 print(f"   Total bytes: {result['total_bytes']:,}")
 
@@ -246,7 +245,7 @@ def demo_directory_copying() -> None:
                     print(f"   Verified {file_count} files in {dest_to_check.name}")
 
                     # Show directory structure
-                    print(f"\n📋 Directory structure preserved:")
+                    print("\n📋 Directory structure preserved:")
                     for file_path in sorted([f for f in dest_files if f.is_file()]):
                         rel_path = file_path.relative_to(dest_to_check)
                         print(f"   📄 {rel_path}")
@@ -310,7 +309,7 @@ def demo_source_verification() -> None:
             )
 
             if result["success"]:
-                print(f"✅ Copy and source verification completed!")
+                print("✅ Copy and source verification completed!")
                 print(f"   Files copied: {result['files_copied']}")
 
                 # Check verification results
@@ -320,12 +319,12 @@ def demo_source_verification() -> None:
                 )
 
                 print(f"   Source verified: {verified_count}/{len(clips)} files")
-                print(f"\n📋 Source verification ensures:")
-                print(f"   • Source files unchanged during copy")
-                print(f"   • No card or reader issues detected")
-                print(f"   • Complete integrity chain established")
+                print("\n📋 Source verification ensures:")
+                print("   • Source files unchanged during copy")
+                print("   • No card or reader issues detected")
+                print("   • Complete integrity chain established")
             else:
-                print(f"❌ Copy or verification failed")
+                print("❌ Copy or verification failed")
 
         except Exception as e:
             print(f"❌ Source verification error: {e}")
