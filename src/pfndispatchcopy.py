@@ -11,12 +11,12 @@ import argparse
 import hashlib
 import logging
 import os
+import queue
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any, Union
-import sys
-import queue
+from typing import Any
 
 try:
     import xxhash
@@ -84,7 +84,7 @@ class ProgressTracker:
                 self.last_update = current_time
                 self.last_percentage = current_percentage
 
-    def get_stats(self) -> Tuple[float, float]:
+    def get_stats(self) -> tuple[float, float]:
         """
         Get copy statistics.
 
@@ -188,8 +188,8 @@ class ParallelWriter:
 
     def __init__(
         self,
-        destinations: List[Path],
-        temp_files: Dict[Path, Path],
+        destinations: list[Path],
+        temp_files: dict[Path, Path],
         progress_tracker: ProgressTracker,
     ) -> None:
         """
@@ -265,7 +265,7 @@ class ParallelWriter:
         except Exception as e:
             self.write_errors[destination] = str(e)
 
-    def start_writers(self) -> List[threading.Thread]:
+    def start_writers(self) -> list[threading.Thread]:
         """Start all writer threads."""
         threads = []
         for dest in self.destinations:
@@ -281,7 +281,7 @@ class ParallelWriter:
         for dest in self.destinations:
             self.chunk_queues[dest].put(chunk)
 
-    def stop_writers(self, threads: List[threading.Thread]) -> None:
+    def stop_writers(self, threads: list[threading.Thread]) -> None:
         """Stop all writer threads and wait for completion."""
         # Send stop sentinel to all queues
         for dest in self.destinations:
@@ -317,7 +317,7 @@ class PSTaskWrapper:
         self.total_bytes = 0
         self.copied_bytes = 0
 
-    def discover_files(self, source_path: Path) -> List[Path]:
+    def discover_files(self, source_path: Path) -> list[Path]:
         """
         Discover all files in source path (file or directory).
 
@@ -364,8 +364,8 @@ class PSTaskWrapper:
             return file_path.relative_to(source_root)
 
     def map_destinations(
-        self, source_file: Path, source_root: Path, destination_roots: List[Path]
-    ) -> List[Path]:
+        self, source_file: Path, source_root: Path, destination_roots: list[Path]
+    ) -> list[Path]:
         """
         Map source file to corresponding destination paths.
 
@@ -399,13 +399,13 @@ class PSTaskWrapper:
     def copy_directory_structure(
         self,
         source: Path,
-        destinations: List[Path],
+        destinations: list[Path],
         buffer_size: int = 8388608,
-        expected_size: Optional[int] = None,
-        noflush_destinations: List[Path] = None,
-        hash_algorithm: Optional[str] = None,
+        expected_size: int | None = None,
+        noflush_destinations: list[Path] | None = None,
+        hash_algorithm: str | None = None,
         keep_source: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Copy entire directory structure to multiple destinations.
 
@@ -541,14 +541,14 @@ class PSTaskWrapper:
 
     def launch_copy(
         self,
-        source: Union[Path, str],
-        destinations: Union[List[Path], List[str]],
+        source: Path | str,
+        destinations: list[Path | str],
         buffer_size: int = 8388608,
-        expected_size: Optional[int] = None,
-        noflush_destinations: Optional[List[Union[Path, str]]] = None,
-        hash_algorithm: Optional[str] = None,
+        expected_size: int | None = None,
+        noflush_destinations: list[Path | str] | None = None,
+        hash_algorithm: str | None = None,
         keep_source: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Launch copy operation for file or directory.
 
@@ -688,13 +688,13 @@ def copy_file_to_destination(
 
 def copy_with_multiple_destinations_parallel(
     source: Path,
-    destinations: List[Path],
+    destinations: list[Path],
     buffer_size: int,
-    expected_size: Optional[int] = None,
-    noflush_destinations: List[Path] = None,
-    hash_algorithm: Optional[str] = None,
+    expected_size: int | None = None,
+    noflush_destinations: list[Path] | None = None,
+    hash_algorithm: str | None = None,
     keep_source: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Copy source file to multiple destinations with true parallel writing.
 
@@ -846,13 +846,13 @@ def copy_with_multiple_destinations_parallel(
 
 def copy_with_multiple_destinations(
     source: Path,
-    destinations: List[Path],
+    destinations: list[Path],
     buffer_size: int,
-    expected_size: Optional[int] = None,
-    noflush_destinations: List[Path] = None,
-    hash_algorithm: Optional[str] = None,
+    expected_size: int | None = None,
+    noflush_destinations: list[Path] | None = None,
+    hash_algorithm: str | None = None,
     keep_source: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Copy source file to multiple destinations simultaneously.
 
