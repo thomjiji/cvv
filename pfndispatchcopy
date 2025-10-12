@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""
+Command-line entry point for pfndispatchcopy.
+
+This script provides a convenient command-line interface to the pfndispatchcopy
+tool without requiring users to specify the full path to the Python module.
+"""
+
+import sys
+from pathlib import Path
+
+# Add src directory to Python path
+src_dir = Path(__file__).parent / "src"
+sys.path.insert(0, str(src_dir))
+
+# Import and run the main function
+from pfndispatchcopy import main
+
+if __name__ == "__main__":
+    sys.exit(main())
