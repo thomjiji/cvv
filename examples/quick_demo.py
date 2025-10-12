@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from pfndispatchcopy import (
     copy_with_multiple_destinations,
     PSTaskWrapper,
+    VerificationMode,
     setup_logging,
 )
 
@@ -260,6 +261,76 @@ def demo_directory_copying() -> None:
             print(f"❌ Directory copy error: {e}")
 
 
+def demo_source_verification() -> None:
+    """Demonstrate source verification capabilities."""
+    print("\n" + "=" * 50)
+    print("🔍 DEMO: Source Verification")
+    print("=" * 50)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+
+        # Create test directory structure
+        source_dir = temp_path / "camera_footage"
+
+        # Simulate camera clips
+        clips = [
+            ("CLIP001.MOV", "Camera clip 001 data" * 200),
+            ("CLIP002.MOV", "Camera clip 002 data" * 250),
+            ("CLIP003.MOV", "Camera clip 003 data" * 180),
+        ]
+
+        for clip_name, content in clips:
+            clip_path = source_dir / clip_name
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_text(content)
+
+        print(f"📂 Created {len(clips)} camera clips")
+
+        # Create backup destinations
+        destinations = [
+            temp_path / "working_drive",
+            temp_path / "archive_drive",
+        ]
+
+        print(
+            f"🎯 Copying to {len(destinations)} destinations with source verification..."
+        )
+
+        # Use PSTaskWrapper with source verification
+        task_wrapper = PSTaskWrapper(verbose=False)  # Less verbose for demo
+
+        try:
+            result = task_wrapper.launch_copy(
+                source=source_dir,
+                destinations=destinations,
+                buffer_size=64 * 1024,
+                hash_algorithm="sha1",
+                source_verification=VerificationMode.AFTER_ALL,
+            )
+
+            if result["success"]:
+                print(f"✅ Copy and source verification completed!")
+                print(f"   Files copied: {result['files_copied']}")
+
+                # Check verification results
+                verify_results = result.get("source_verification_results", {})
+                verified_count = sum(
+                    1 for v in verify_results.values() if v.get("verified")
+                )
+
+                print(f"   Source verified: {verified_count}/{len(clips)} files")
+                print(f"\n📋 Source verification ensures:")
+                print(f"   • Source files unchanged during copy")
+                print(f"   • No card or reader issues detected")
+                print(f"   • Complete integrity chain established")
+            else:
+                print(f"❌ Copy or verification failed")
+
+        except Exception as e:
+            print(f"❌ Source verification error: {e}")
+
+
 def demo_error_handling() -> None:
     """Demonstrate error handling capabilities."""
     print("\n" + "=" * 50)
@@ -312,6 +383,7 @@ def main() -> None:
         demo_performance_comparison()
         demo_integrity_verification()
         demo_directory_copying()
+        demo_source_verification()
         demo_error_handling()
 
         print("\n" + "=" * 60)
@@ -321,6 +393,7 @@ def main() -> None:
         print("   • Performance optimization with different buffer sizes")
         print("   • Hash verification with multiple algorithms")
         print("   • Directory structure copying with preserved hierarchy")
+        print("   • Source verification for professional DIT workflows")
         print("   • Error handling and validation")
         print("")
         print("📚 See README.md for detailed usage instructions")

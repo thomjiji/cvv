@@ -15,6 +15,8 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,157 @@ try:
     has_xxhash = True
 except ImportError:
     has_xxhash = False
+
+
+class VerificationMode(Enum):
+    """Source verification modes."""
+
+    NONE = "none"
+    PER_FILE = "per_file"
+    AFTER_ALL = "after_all"
+
+
+@dataclass
+class VerificationResult:
+    """Result of source verification for a file."""
+
+    file_path: Path
+    verified: bool
+    initial_hash: str
+    final_source_hash: str | None = None
+    error: str | None = None
+
+
+class SourceVerifier:
+    """Handle source verification for copied files."""
+
+    def __init__(self, hash_algorithm: str) -> None:
+        """
+        Initialize source verifier.
+
+        Parameters
+        ----------
+        hash_algorithm : str
+            Hash algorithm to use for verification
+        """
+        self.hash_algorithm = hash_algorithm
+        self.initial_hashes: dict[Path, str] = {}
+        self.verification_results: dict[Path, VerificationResult] = {}
+        self.lock = threading.Lock()
+
+    def store_initial_hash(self, file_path: Path, hash_value: str) -> None:
+        """
+        Store initial hash for a file.
+
+        Parameters
+        ----------
+        file_path : Path
+            Path to the file
+        hash_value : str
+            Initial hash value
+        """
+        with self.lock:
+            self.initial_hashes[file_path] = hash_value
+
+    def verify_source(
+        self, file_path: Path, buffer_size: int = 8388608
+    ) -> VerificationResult:
+        """
+        Verify source file by recalculating its hash.
+
+        Parameters
+        ----------
+        file_path : Path
+            Path to source file
+        buffer_size : int
+            Buffer size for reading
+
+        Returns
+        -------
+        VerificationResult
+            Verification result
+        """
+        if file_path not in self.initial_hashes:
+            return VerificationResult(
+                file_path=file_path,
+                verified=False,
+                initial_hash="",
+                error="No initial hash stored",
+            )
+
+        initial_hash = self.initial_hashes[file_path]
+
+        try:
+            hash_calc = HashCalculator(self.hash_algorithm)
+            final_hash = hash_calc.calculate(file_path, buffer_size)
+
+            verified = initial_hash == final_hash
+
+            result = VerificationResult(
+                file_path=file_path,
+                verified=verified,
+                initial_hash=initial_hash,
+                final_source_hash=final_hash,
+                error=None if verified else "Hash mismatch - source file changed",
+            )
+
+        except Exception as e:
+            result = VerificationResult(
+                file_path=file_path,
+                verified=False,
+                initial_hash=initial_hash,
+                final_source_hash=None,
+                error=str(e),
+            )
+
+        with self.lock:
+            self.verification_results[file_path] = result
+
+        return result
+
+    def verify_all_sources(
+        self, buffer_size: int = 8388608
+    ) -> dict[Path, VerificationResult]:
+        """
+        Verify all stored source files.
+
+        Parameters
+        ----------
+        buffer_size : int
+            Buffer size for reading
+
+        Returns
+        -------
+        dict[Path, VerificationResult]
+            Verification results for all files
+        """
+        results = {}
+
+        for file_path in self.initial_hashes.keys():
+            result = self.verify_source(file_path, buffer_size)
+            results[file_path] = result
+
+        return results
+
+    def get_summary(self) -> dict[str, int]:
+        """
+        Get verification summary statistics.
+
+        Returns
+        -------
+        dict[str, int]
+            Summary with counts of verified, failed, and pending
+        """
+        verified = sum(1 for r in self.verification_results.values() if r.verified)
+        failed = sum(1 for r in self.verification_results.values() if not r.verified)
+        pending = len(self.initial_hashes) - len(self.verification_results)
+
+        return {
+            "verified": verified,
+            "failed": failed,
+            "pending": pending,
+            "total": len(self.initial_hashes),
+        }
 
 
 class ProgressTracker:
@@ -67,7 +220,8 @@ class ProgressTracker:
                 (bytes_copied / self.total_size * 100) if self.total_size > 0 else 0
             )
 
-            # Update if enough time has passed AND (enough bytes copied OR significant percentage change)
+            # Update if enough time has passed AND (enough bytes copied OR significant
+            # percentage change)
             time_threshold = current_time - self.last_update >= self.update_interval
             bytes_threshold = (
                 bytes_copied - (self.total_size * self.last_percentage / 100)
@@ -292,6 +446,85 @@ class ParallelWriter:
             thread.join()
 
 
+def copy_with_source_verification(
+    source: Path,
+    destinations: list[Path],
+    buffer_size: int,
+    hash_algorithm: str,
+    noflush_destinations: list[Path] | None = None,
+    keep_source: bool = True,
+) -> dict[str, any]:
+    """
+    Copy file with integrated source verification.
+
+    Parameters
+    ----------
+    source : Path
+        Source file path
+    destinations : list[Path]
+        List of destination paths
+    buffer_size : int
+        Buffer size for copying
+    hash_algorithm : str
+        Hash algorithm for verification
+    noflush_destinations : list[Path] | None
+        Destinations to skip flushing
+    keep_source : bool
+        Whether to keep source file
+
+    Returns
+    -------
+    dict[str, any]
+        Copy and verification results
+    """
+    # First, perform the copy with hash calculation
+    copy_result = copy_with_multiple_destinations_parallel(
+        source=source,
+        destinations=destinations,
+        buffer_size=buffer_size,
+        noflush_destinations=noflush_destinations,
+        hash_algorithm=hash_algorithm,
+        keep_source=keep_source,
+    )
+
+    if not copy_result.get("success"):
+        return copy_result
+
+    # Store initial hash
+    initial_hash = copy_result.get("hash")
+
+    # Now verify the source by reading it again
+    logging.info(f"Verifying source file: {source}")
+    hash_calc = HashCalculator(hash_algorithm)
+
+    try:
+        final_source_hash = hash_calc.calculate(source, buffer_size)
+
+        if initial_hash == final_source_hash:
+            logging.info(
+                f"✓ Source verification passed: {source.name} (hash: {final_source_hash[:16]}...)"
+            )
+            copy_result["source_verified"] = True
+            copy_result["source_verification_status"] = "PASSED"
+        else:
+            logging.error(
+                f"✗ Source verification FAILED: {source.name} - file changed during copy!"
+            )
+            logging.error(f"  Initial hash:  {initial_hash}")
+            logging.error(f"  Current hash:  {final_source_hash}")
+            copy_result["source_verified"] = False
+            copy_result["source_verification_status"] = "FAILED"
+            copy_result["success"] = False
+
+    except Exception as e:
+        logging.error(f"✗ Source verification error for {source.name}: {e}")
+        copy_result["source_verified"] = False
+        copy_result["source_verification_status"] = "ERROR"
+        copy_result["source_verification_error"] = str(e)
+
+    return copy_result
+
+
 class PSTaskWrapper:
     """
     Wrapper class that handles both file and directory copying operations.
@@ -316,6 +549,7 @@ class PSTaskWrapper:
         self.failed_files = 0
         self.total_bytes = 0
         self.copied_bytes = 0
+        self.source_verifier: SourceVerifier | None = None
 
     def discover_files(self, source_path: Path) -> list[Path]:
         """
@@ -328,7 +562,7 @@ class PSTaskWrapper:
 
         Returns
         -------
-        List[Path]
+        list[Path]
             List of all files to be copied
         """
         if source_path.is_file():
@@ -375,12 +609,12 @@ class PSTaskWrapper:
             Source file path
         source_root : Path
             Source root path (file or directory)
-        destination_roots : List[Path]
+        destination_roots : list[Path]
             List of destination root paths
 
         Returns
         -------
-        List[Path]
+        list[Path]
             List of mapped destination file paths
         """
         relative_path = self.calculate_relative_path(source_file, source_root)
@@ -405,7 +639,8 @@ class PSTaskWrapper:
         noflush_destinations: list[Path] | None = None,
         hash_algorithm: str | None = None,
         keep_source: bool = True,
-    ) -> dict[str, Any]:
+        source_verification: VerificationMode | None = None,
+    ) -> dict[str, any]:
         """
         Copy entire directory structure to multiple destinations.
 
@@ -413,28 +648,40 @@ class PSTaskWrapper:
         ----------
         source : Path
             Source directory path
-        destinations : List[Path]
+        destinations : list[Path]
             List of destination directory paths
         buffer_size : int
             Buffer size for copying operations
         expected_size : Optional[int]
             Expected total size for verification (optional for directories)
-        noflush_destinations : List[Path], optional
+        noflush_destinations : list[Path] | None
             Destinations to skip flushing for
-        hash_algorithm : Optional[str]
+        hash_algorithm : str | None
             Hash algorithm for verification
         keep_source : bool
             Whether to keep source after copying
+        source_verification : VerificationMode
+            Source verification mode
 
         Returns
         -------
-        Dict[str, Any]
+        dict[str, any]
             Copy results including statistics and success status
         """
         if noflush_destinations is None:
             noflush_destinations = []
 
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
+
+        # Initialize source verifier if needed
+        if source_verification is None:
+            source_verification = VerificationMode.NONE
+
+        if source_verification != VerificationMode.NONE and hash_algorithm:
+            self.source_verifier = SourceVerifier(hash_algorithm)
+            logging.info(
+                f"Source verification enabled: {source_verification.value} mode"
+            )
 
         # Discover all files in source
         source_files = self.discover_files(source)
@@ -460,6 +707,9 @@ class PSTaskWrapper:
             "total_files": self.total_files,
             "total_bytes": self.total_bytes,
             "file_results": {},
+            "source_verification_enabled": source_verification != VerificationMode.NONE,
+            "source_verification_mode": source_verification.value,
+            "source_verification_results": {},
         }
 
         # Process each file
@@ -479,7 +729,17 @@ class PSTaskWrapper:
                             break
 
                 # Copy file to all destinations
-                if len(dest_files) > 1:
+                if source_verification == VerificationMode.PER_FILE and hash_algorithm:
+                    # Copy with immediate source verification
+                    file_result = copy_with_source_verification(
+                        source=source_file,
+                        destinations=dest_files,
+                        buffer_size=buffer_size,
+                        hash_algorithm=hash_algorithm,
+                        noflush_destinations=noflush_for_file,
+                        keep_source=keep_source,
+                    )
+                elif len(dest_files) > 1:
                     file_result = copy_with_multiple_destinations_parallel(
                         source=source_file,
                         destinations=dest_files,
@@ -496,6 +756,16 @@ class PSTaskWrapper:
                         noflush_destinations=noflush_for_file,
                         hash_algorithm=hash_algorithm,
                         keep_source=keep_source,
+                    )
+
+                # Store hash for later verification if needed
+                if (
+                    source_verification == VerificationMode.AFTER_ALL
+                    and self.source_verifier
+                    and file_result.get("hash")
+                ):
+                    self.source_verifier.store_initial_hash(
+                        source_file, file_result["hash"]
                     )
 
                 if file_result["success"]:
@@ -537,6 +807,52 @@ class PSTaskWrapper:
             logging.warning(f"Failed files: {self.failed_files}")
             results["success"] = False
 
+        # Perform source verification after all files if needed
+        if (
+            source_verification == VerificationMode.AFTER_ALL
+            and self.source_verifier
+            and results["success"]
+        ):
+            logging.info("")
+            logging.info("=" * 60)
+            logging.info("Starting source verification for all files...")
+            logging.info("=" * 60)
+
+            verification_results = self.source_verifier.verify_all_sources(buffer_size)
+
+            for source_file, verify_result in verification_results.items():
+                rel_path = (
+                    source_file.relative_to(source)
+                    if source.is_dir()
+                    else source_file.name
+                )
+
+                if verify_result.verified:
+                    logging.info(f"✓ Source verified: {rel_path}")
+                else:
+                    logging.error(
+                        f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
+                    )
+                    results["success"] = False
+
+                results["source_verification_results"][str(source_file)] = {
+                    "verified": verify_result.verified,
+                    "error": verify_result.error,
+                    "initial_hash": verify_result.initial_hash,
+                    "final_hash": verify_result.final_source_hash,
+                }
+
+            # Summary
+            summary = self.source_verifier.get_summary()
+            logging.info("")
+            logging.info(f"Source verification summary:")
+            logging.info(f"  Verified: {summary['verified']}")
+            logging.info(f"  Failed: {summary['failed']}")
+            logging.info(f"  Pending: {summary['pending']}")
+
+            if summary["failed"] > 0:
+                results["success"] = False
+
         return results
 
     def launch_copy(
@@ -548,30 +864,33 @@ class PSTaskWrapper:
         noflush_destinations: list[Path | str] | None = None,
         hash_algorithm: str | None = None,
         keep_source: bool = True,
+        source_verification: VerificationMode | None = None,
     ) -> dict[str, Any]:
         """
         Launch copy operation for file or directory.
 
         Parameters
         ----------
-        source : Union[Path, str]
+        source : Path | str
             Source file or directory path
-        destinations : Union[List[Path], List[str]]
+        destinations : list[Path] | list[str]
             List of destination paths
         buffer_size : int
             Buffer size for copying operations
-        expected_size : Optional[int]
+        expected_size : int | None
             Expected file/directory size for verification
-        noflush_destinations : Optional[List[Union[Path, str]]]
+        noflush_destinations : list[Path | str] | None
             Destinations to skip flushing for
-        hash_algorithm : Optional[str]
+        hash_algorithm : str | None
             Hash algorithm for verification
         keep_source : bool
             Whether to keep source after copying
+        source_verification : VerificationMode | None
+            Source verification mode (NONE, PER_FILE, AFTER_ALL)
 
         Returns
         -------
-        Dict[str, Any]
+        dict[str, any]
             Copy results
         """
         # Convert to Path objects
@@ -579,9 +898,22 @@ class PSTaskWrapper:
         dest_paths = [Path(dest) for dest in destinations]
         noflush_paths = [Path(dest) for dest in (noflush_destinations or [])]
 
+        if source_verification is None:
+            source_verification = VerificationMode.NONE
+
         if source_path.is_file():
             # Single file copy
-            if len(dest_paths) > 1:
+            if source_verification != VerificationMode.NONE and hash_algorithm:
+                # Use source verification for single file
+                return copy_with_source_verification(
+                    source=source_path,
+                    destinations=dest_paths,
+                    buffer_size=buffer_size,
+                    hash_algorithm=hash_algorithm,
+                    noflush_destinations=noflush_paths,
+                    keep_source=keep_source,
+                )
+            elif len(dest_paths) > 1:
                 return copy_with_multiple_destinations_parallel(
                     source=source_path,
                     destinations=dest_paths,
@@ -602,7 +934,7 @@ class PSTaskWrapper:
                     keep_source=keep_source,
                 )
         elif source_path.is_dir():
-            # Directory copy
+            # Directory copy with source verification support
             return self.copy_directory_structure(
                 source=source_path,
                 destinations=dest_paths,
@@ -611,6 +943,7 @@ class PSTaskWrapper:
                 noflush_destinations=noflush_paths,
                 hash_algorithm=hash_algorithm,
                 keep_source=keep_source,
+                source_verification=source_verification,
             )
         else:
             raise FileNotFoundError(f"Source path does not exist: {source_path}")
@@ -706,22 +1039,22 @@ def copy_with_multiple_destinations_parallel(
     ----------
     source : Path
         Source file path
-    destinations : List[Path]
+    destinations : list[Path]
         List of destination paths
     buffer_size : int
         Buffer size for copying operations
-    expected_size : Optional[int]
+    expected_size : int | None
         Expected file size for verification
-    noflush_destinations : List[Path], optional
+    noflush_destinations : list[Path] | None
         Destinations to skip flushing for
-    hash_algorithm : Optional[str]
+    hash_algorithm : str | None
         Hash algorithm for verification
     keep_source : bool
         Whether to keep source file after copying
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, any]
         Copy results including hash, speed, and success status
 
     Raises
@@ -860,22 +1193,22 @@ def copy_with_multiple_destinations(
     ----------
     source : Path
         Source file path
-    destinations : List[Path]
+    destinations : list[Path]
         List of destination paths
     buffer_size : int
         Buffer size for copying operations
-    expected_size : Optional[int]
+    expected_size : int | None
         Expected file size for verification
-    noflush_destinations : List[Path], optional
+    noflush_destinations : list[Path] | None
         Destinations to skip flushing for
-    hash_algorithm : Optional[str]
+    hash_algorithm : str | None
         Hash algorithm for verification
     keep_source : bool
         Whether to keep source file after copying
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, any]
         Copy results including hash, speed, and success status
 
     Raises
@@ -1055,6 +1388,15 @@ Examples:
         help="Hash algorithm for verification (default: none)",
     )
 
+    # Source verification
+    parser.add_argument(
+        "--source-verify",
+        type=str,
+        default="none",
+        choices=["none", "per_file", "after_all"],
+        help="Source verification mode: none (default), per_file (verify each file after copy), after_all (verify all files after all copies complete)",
+    )
+
     # Keep source file
     parser.add_argument(
         "-k",
@@ -1124,6 +1466,23 @@ def main() -> int:
         # Use PSTaskWrapper for unified file/directory handling
         task_wrapper = PSTaskWrapper(verbose=args.verbose)
 
+        # Convert source verification mode
+        verify_mode_map = {
+            "none": VerificationMode.NONE,
+            "per_file": VerificationMode.PER_FILE,
+            "after_all": VerificationMode.AFTER_ALL,
+        }
+        source_verify_mode = verify_mode_map.get(
+            args.source_verify, VerificationMode.NONE
+        )
+
+        # Source verification requires hash algorithm
+        if source_verify_mode != VerificationMode.NONE and not args.hash:
+            logging.warning(
+                "Source verification requires hash algorithm (-t). Disabling source verification."
+            )
+            source_verify_mode = VerificationMode.NONE
+
         results = task_wrapper.launch_copy(
             source=args.source,
             destinations=args.destinations,
@@ -1132,6 +1491,7 @@ def main() -> int:
             noflush_destinations=noflush_destinations,
             hash_algorithm=args.hash,
             keep_source=args.keep,
+            source_verification=source_verify_mode,
         )
 
         if results["success"]:
