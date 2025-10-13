@@ -46,6 +46,35 @@ class VerificationResult:
     error: str | None = None
 
 
+@dataclass
+class CopyConfig:
+    """Configuration for file copy operations."""
+
+    buffer_size: int = 8388608
+    hash_algorithm: str | None = None
+    verbose: bool = False
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.buffer_size <= 0:
+            raise ValueError(f"Buffer size must be positive, got {self.buffer_size}")
+
+        if self.hash_algorithm is not None:
+            valid_algorithms = ["xxh64be", "md5", "sha1", "sha256"]
+            if self.hash_algorithm.lower() not in valid_algorithms:
+                raise ValueError(f"Invalid hash algorithm: {self.hash_algorithm}")
+            self.hash_algorithm = self.hash_algorithm.lower()
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "CopyConfig":
+        """Create config from command-line arguments."""
+        return cls(
+            buffer_size=args.buffer_size,
+            hash_algorithm=args.hash,
+            verbose=args.verbose,
+        )
+
+
 class SourceVerifier:
     """Handle source verification for copied files."""
 
@@ -344,25 +373,13 @@ class ParallelWriter:
         destinations: list[Path],
         temp_files: dict[Path, Path],
         progress_tracker: ProgressTracker,
-        hash_algorithm: str | None = None,
+        config: CopyConfig,
     ) -> None:
-        """
-        Initialize parallel writer.
-
-        Parameters
-        ----------
-        destinations : List[Path]
-            List of destination paths
-        temp_files : Dict[Path, Path]
-            Mapping of destinations to temporary files
-        progress_tracker : ProgressTracker
-            Progress tracking instance
-        hash_algorithm : str | None
-            Hash algorithm to use for calculating hash during read
-        """
+        """Initialize parallel writer."""
         self.destinations = destinations
         self.temp_files = temp_files
         self.progress_tracker = progress_tracker
+        self.config = config
         self.chunk_queues = {dest: queue.Queue() for dest in destinations}
         self.file_handles = {}
         self.write_errors = {}
@@ -371,23 +388,22 @@ class ParallelWriter:
         self.write_lock = threading.Lock()
 
         # Initialize hash calculator if requested
-        self.hash_algorithm = hash_algorithm
         self.hasher = None
-        if hash_algorithm:
-            if hash_algorithm.lower() == "xxh64be":
+        if config.hash_algorithm:
+            if config.hash_algorithm == "xxh64be":
                 if not has_xxhash:
                     raise ValueError(
                         "xxhash library not available. Install with: pip install xxhash"
                     )
                 self.hasher = xxhash.xxh64()
-            elif hash_algorithm.lower() == "md5":
+            elif config.hash_algorithm == "md5":
                 self.hasher = hashlib.md5()
-            elif hash_algorithm.lower() == "sha1":
+            elif config.hash_algorithm == "sha1":
                 self.hasher = hashlib.sha1()
-            elif hash_algorithm.lower() == "sha256":
+            elif config.hash_algorithm == "sha256":
                 self.hasher = hashlib.sha256()
             else:
-                raise ValueError(f"Unsupported hash algorithm: {hash_algorithm}")
+                raise ValueError(f"Unsupported hash algorithm: {config.hash_algorithm}")
 
     def open_files(self) -> None:
         """Open all destination files for writing."""
@@ -452,11 +468,9 @@ class ParallelWriter:
         return threads
 
     def distribute_chunk(self, chunk: ChunkData) -> None:
-        """Distribute a chunk to all writer queues and update hash if enabled."""
-        # Update hash with this chunk
+        """Distribute chunk to all writers and update hash."""
         if self.hasher is not None:
             self.hasher.update(chunk.data)
-
         for dest in self.destinations:
             self.chunk_queues[dest].put(chunk)
 
@@ -471,92 +485,102 @@ class ParallelWriter:
             thread.join()
 
     def get_hash(self) -> str | None:
-        """
-        Get the calculated hash digest.
-
-        Returns
-        -------
-        str | None
-            Hexadecimal hash digest, or None if no hash was calculated
-        """
+        """Get calculated hash digest."""
         if self.hasher is not None:
             return self.hasher.hexdigest()
         return None
 
 
-def copy_with_source_verification(
+def copy_file(
     source: Path,
     destinations: list[Path],
-    buffer_size: int,
-    hash_algorithm: str,
-    keep_source: bool = True,
-) -> dict[str, any]:
-    """
-    Copy file with integrated source verification.
+    config: CopyConfig,
+) -> dict[str, Any]:
+    """Unified file copy function with parallel I/O."""
+    if not source.exists():
+        raise FileNotFoundError(f"Source file not found: {source}")
 
-    Parameters
-    ----------
-    source : Path
-        Source file path
-    destinations : list[Path]
-        List of destination paths
-    buffer_size : int
-        Buffer size for copying
-    hash_algorithm : str
-        Hash algorithm for verification
-    keep_source : bool
-        Whether to keep source file
+    actual_size = source.stat().st_size
 
-    Returns
-    -------
-    dict[str, any]
-        Copy and verification results
-    """
-    # First, perform the copy with hash calculation
-    copy_result = copy_with_multiple_destinations_parallel(
-        source=source,
-        destinations=destinations,
-        buffer_size=buffer_size,
-        hash_algorithm=hash_algorithm,
-        keep_source=keep_source,
-    )
+    logging.info(f"copying {source}...")
 
-    if not copy_result.get("success"):
-        return copy_result
-
-    # Store initial hash
-    initial_hash = copy_result.get("hash")
-
-    # Now verify the source by reading it again
-    logging.info(f"Verifying source file: {source}")
-    hash_calc = HashCalculator(hash_algorithm)
+    progress_tracker = ProgressTracker(actual_size)
+    results = {"success": True, "destinations": {}}
 
     try:
-        final_source_hash = hash_calc.calculate(source, buffer_size)
+        # Create temporary files for all destinations
+        temp_files: dict[Path, Path] = {}
+        for dest in destinations:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = dest.parent / f".{dest.name}.tmp"
+            temp_files[dest] = temp_file
 
-        if initial_hash == final_source_hash:
-            logging.info(
-                f"✓ Source verification passed: {source.name} (hash: {final_source_hash[:16]}...)"
-            )
-            copy_result["source_verified"] = True
-            copy_result["source_verification_status"] = "PASSED"
-        else:
-            logging.error(
-                f"✗ Source verification FAILED: {source.name} - file changed during copy!"
-            )
-            logging.error(f"  Initial hash:  {initial_hash}")
-            logging.error(f"  Current hash:  {final_source_hash}")
-            copy_result["source_verified"] = False
-            copy_result["source_verification_status"] = "FAILED"
-            copy_result["success"] = False
+        # Initialize parallel writer
+        parallel_writer = ParallelWriter(
+            destinations, temp_files, progress_tracker, config
+        )
+        parallel_writer.open_files()
+
+        try:
+            # Start writer threads
+            writer_threads = parallel_writer.start_writers()
+
+            # Read source and distribute chunks to writers
+            chunk_id = 0
+            with open(source, "rb") as src:
+                while chunk := src.read(config.buffer_size):
+                    chunk_data = ChunkData(chunk_id, chunk)
+                    parallel_writer.distribute_chunk(chunk_data)
+                    chunk_id += 1
+
+            # Stop all writer threads
+            parallel_writer.stop_writers(writer_threads)
+
+            # Check for write errors
+            if parallel_writer.write_errors:
+                results["success"] = False
+                for dest, error in parallel_writer.write_errors.items():
+                    results["destinations"][str(dest)] = f"Write error: {error}"
+                    logging.error(f"Write error for {dest}: {error}")
+                return results
+
+        finally:
+            parallel_writer.close_files()
+
+        # Verify and move files
+        for dest in destinations:
+            temp_file = temp_files[dest]
+            if temp_file.stat().st_size != actual_size:
+                results["success"] = False
+                results["destinations"][str(dest)] = "File size mismatch"
+                continue
+
+            temp_file.rename(dest)
+            logging.info(f"Copy completed successfully: {dest}")
+            results["destinations"][str(dest)] = "success"
+
+        # Calculate performance stats
+        duration, speed = progress_tracker.get_stats()
+        results["duration"] = duration
+        results["speed_mb_sec"] = speed
+        logging.info(
+            f"copy speed {actual_size} bytes in {duration:.5f} sec ({speed:.1f} MB/sec)"
+        )
+
+        # Get hash if calculated
+        file_hash = parallel_writer.get_hash()
+        if file_hash and config.hash_algorithm:
+            logging.info(f"hash {config.hash_algorithm.upper()}:{file_hash}")
+            results["hash"] = file_hash
+
+        logging.info("done.")
+        return results
 
     except Exception as e:
-        logging.error(f"✗ Source verification error for {source.name}: {e}")
-        copy_result["source_verified"] = False
-        copy_result["source_verification_status"] = "ERROR"
-        copy_result["source_verification_error"] = str(e)
-
-    return copy_result
+        for temp_file in temp_files.values():
+            if temp_file.exists():
+                temp_file.unlink()
+        raise OSError(f"Copy operation failed: {e}")
 
 
 class PSTaskWrapper:
@@ -568,16 +592,10 @@ class PSTaskWrapper:
     to multiple destinations while preserving directory structure.
     """
 
-    def __init__(self, verbose: bool = False) -> None:
-        """
-        Initialize PSTaskWrapper.
-
-        Parameters
-        ----------
-        verbose : bool
-            Enable verbose logging
-        """
-        self.verbose = verbose
+    def __init__(self, config: CopyConfig) -> None:
+        """Initialize PSTaskWrapper."""
+        self.config = config
+        self.verbose = config.verbose
         self.total_files = 0
         self.completed_files = 0
         self.failed_files = 0
@@ -668,49 +686,9 @@ class PSTaskWrapper:
         self,
         source: Path,
         destinations: list[Path],
-        buffer_size: int = 8388608,
-        expected_size: int | None = None,
-        hash_algorithm: str | None = None,
-        keep_source: bool = True,
-        source_verification: VerificationMode | None = None,
-    ) -> dict[str, any]:
-        """
-        Copy entire directory structure to multiple destinations.
-
-        Parameters
-        ----------
-        source : Path
-            Source directory path
-        destinations : list[Path]
-            List of destination directory paths
-        buffer_size : int
-            Buffer size for copying operations
-        expected_size : Optional[int]
-            Expected total size for verification (optional for directories)
-        hash_algorithm : str | None
-            Hash algorithm for verification
-        keep_source : bool
-            Whether to keep source after copying
-        source_verification : VerificationMode
-            Source verification mode
-
-        Returns
-        -------
-        dict[str, any]
-            Copy results including statistics and success status
-        """
-        # Initialize result tracking
+    ) -> dict[str, Any]:
+        """Copy directory structure to multiple destinations."""
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
-
-        # Initialize source verifier if needed
-        if source_verification is None:
-            source_verification = VerificationMode.NONE
-
-        if source_verification != VerificationMode.NONE and hash_algorithm:
-            self.source_verifier = SourceVerifier(hash_algorithm)
-            logging.info(
-                f"Source verification enabled: {source_verification.value} mode"
-            )
 
         # Discover all files in source
         source_files = self.discover_files(source)
@@ -724,10 +702,6 @@ class PSTaskWrapper:
 
         # Calculate total size
         self.total_bytes = sum(f.stat().st_size for f in source_files)
-        if expected_size and self.total_bytes != expected_size:
-            logging.warning(
-                f"Size mismatch: expected {expected_size}, found {self.total_bytes}"
-            )
 
         results = {
             "success": True,
@@ -736,9 +710,6 @@ class PSTaskWrapper:
             "total_files": self.total_files,
             "total_bytes": self.total_bytes,
             "file_results": {},
-            "source_verification_enabled": source_verification != VerificationMode.NONE,
-            "source_verification_mode": source_verification.value,
-            "source_verification_results": {},
         }
 
         # Process each file
@@ -747,43 +718,12 @@ class PSTaskWrapper:
                 # Map to destination paths
                 dest_files = self.map_destinations(source_file, source, destinations)
 
-                # Perform copy operation
-                # Copy file to all destinations
-                if source_verification == VerificationMode.PER_FILE and hash_algorithm:
-                    # Copy with immediate source verification
-                    file_result = copy_with_source_verification(
-                        source=source_file,
-                        destinations=dest_files,
-                        buffer_size=buffer_size,
-                        hash_algorithm=hash_algorithm,
-                        keep_source=keep_source,
-                    )
-                elif len(dest_files) > 1:
-                    file_result = copy_with_multiple_destinations_parallel(
-                        source=source_file,
-                        destinations=dest_files,
-                        buffer_size=buffer_size,
-                        hash_algorithm=hash_algorithm,
-                        keep_source=keep_source,
-                    )
-                else:
-                    file_result = copy_with_multiple_destinations(
-                        source=source_file,
-                        destinations=dest_files,
-                        buffer_size=buffer_size,
-                        hash_algorithm=hash_algorithm,
-                        keep_source=keep_source,
-                    )
-
-                # Store hash for later verification if needed
-                if (
-                    source_verification == VerificationMode.AFTER_ALL
-                    and self.source_verifier
-                    and file_result.get("hash")
-                ):
-                    self.source_verifier.store_initial_hash(
-                        source_file, file_result["hash"]
-                    )
+                # Copy file using unified function
+                file_result = copy_file(
+                    source=source_file,
+                    destinations=dest_files,
+                    config=self.config,
+                )
 
                 if file_result["success"]:
                     self.completed_files += 1
@@ -824,494 +764,31 @@ class PSTaskWrapper:
             logging.warning(f"Failed files: {self.failed_files}")
             results["success"] = False
 
-        # Perform source verification after all files if needed
-        if (
-            source_verification == VerificationMode.AFTER_ALL
-            and self.source_verifier
-            and results["success"]
-        ):
-            logging.info("")
-            logging.info("=" * 60)
-            logging.info("Starting source verification for all files...")
-            logging.info("=" * 60)
-
-            verification_results = self.source_verifier.verify_all_sources(buffer_size)
-
-            for source_file, verify_result in verification_results.items():
-                rel_path = (
-                    source_file.relative_to(source)
-                    if source.is_dir()
-                    else source_file.name
-                )
-
-                if verify_result.verified:
-                    logging.info(f"✓ Source verified: {rel_path}")
-                else:
-                    logging.error(
-                        f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
-                    )
-                    results["success"] = False
-
-                results["source_verification_results"][str(source_file)] = {
-                    "verified": verify_result.verified,
-                    "error": verify_result.error,
-                    "initial_hash": verify_result.initial_hash,
-                    "final_hash": verify_result.final_source_hash,
-                }
-
-            # Summary
-            summary = self.source_verifier.get_summary()
-            logging.info("")
-            logging.info("Source verification summary:")
-            logging.info(f"  Verified: {summary['verified']}")
-            logging.info(f"  Failed: {summary['failed']}")
-            logging.info(f"  Pending: {summary['pending']}")
-
-            if summary["failed"] > 0:
-                results["success"] = False
-
         return results
 
     def launch_copy(
         self,
         source: Path | str,
         destinations: list[Path | str],
-        buffer_size: int = 8388608,
-        expected_size: int | None = None,
-        hash_algorithm: str | None = None,
-        keep_source: bool = True,
-        source_verification: VerificationMode | None = None,
     ) -> dict[str, Any]:
-        """
-        Launch copy operation for file or directory.
-
-        Parameters
-        ----------
-        source : Path | str
-            Source file or directory path
-        destinations : list[Path] | list[str]
-            List of destination paths
-        buffer_size : int
-            Buffer size for copying operations
-        expected_size : int | None
-            Expected file/directory size for verification
-        hash_algorithm : str | None
-            Hash algorithm for verification
-        keep_source : bool
-            Whether to keep source after copying
-        source_verification : VerificationMode | None
-            Source verification mode (NONE, PER_FILE, AFTER_ALL)
-
-        Returns
-        -------
-        dict[str, any]
-            Copy results
-        """
-        # Convert to Path objects
+        """Launch copy operation for file or directory."""
         source_path = Path(source)
         dest_paths = [Path(dest) for dest in destinations]
 
-        if source_verification is None:
-            source_verification = VerificationMode.NONE
-
         if source_path.is_file():
-            # Single file copy
-            if source_verification != VerificationMode.NONE and hash_algorithm:
-                # Use source verification for single file
-                return copy_with_source_verification(
-                    source=source_path,
-                    destinations=dest_paths,
-                    buffer_size=buffer_size,
-                    hash_algorithm=hash_algorithm,
-                    keep_source=keep_source,
-                )
-            elif len(dest_paths) > 1:
-                return copy_with_multiple_destinations_parallel(
-                    source=source_path,
-                    destinations=dest_paths,
-                    buffer_size=buffer_size,
-                    expected_size=expected_size,
-                    hash_algorithm=hash_algorithm,
-                    keep_source=keep_source,
-                )
-            else:
-                return copy_with_multiple_destinations(
-                    source=source_path,
-                    destinations=dest_paths,
-                    buffer_size=buffer_size,
-                    expected_size=expected_size,
-                    hash_algorithm=hash_algorithm,
-                    keep_source=keep_source,
-                )
+            return copy_file(
+                source=source_path,
+                destinations=dest_paths,
+                config=self.config,
+            )
         elif source_path.is_dir():
-            # Directory copy with source verification support
+            # Directory copy
             return self.copy_directory_structure(
                 source=source_path,
                 destinations=dest_paths,
-                buffer_size=buffer_size,
-                expected_size=expected_size,
-                hash_algorithm=hash_algorithm,
-                keep_source=keep_source,
-                source_verification=source_verification,
             )
         else:
             raise FileNotFoundError(f"Source path does not exist: {source_path}")
-
-
-def copy_file_to_destination(
-    source: Path,
-    destination: Path,
-    buffer_size: int,
-    progress_tracker: ProgressTracker,
-) -> bool:
-    """
-    Copy file to a single destination with progress tracking.
-
-    Parameters
-    ----------
-    source : Path
-        Source file path
-    destination : Path
-        Destination file path
-    buffer_size : int
-        Buffer size for copying
-    progress_tracker : ProgressTracker
-        Progress tracker instance
-
-    Returns
-    -------
-    bool
-        True if copy successful
-
-    Raises
-    ------
-    IOError
-        If copy operation fails
-    """
-    # Create destination directory if it doesn't exist
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    # Create temporary file in destination directory
-    temp_file = destination.parent / f".{destination.name}.tmp"
-
-    try:
-        with open(source, "rb") as src, open(temp_file, "wb") as dst:
-            bytes_copied = 0
-            while chunk := src.read(buffer_size):
-                dst.write(chunk)
-                bytes_copied += len(chunk)
-                progress_tracker.update(bytes_copied)
-
-        # Verify file size
-        if temp_file.stat().st_size != source.stat().st_size:
-            raise OSError(f"File size mismatch for {destination}")
-
-        # Atomically move temp file to final destination
-        temp_file.rename(destination)
-
-        logging.info(
-            f"Copy completed successfully for destination file with file size check ({destination})"
-        )
-        return True
-
-    except Exception as e:
-        # Clean up temp file on error
-        if temp_file.exists():
-            temp_file.unlink()
-        raise OSError(f"Failed to copy to {destination}: {e}")
-
-
-def copy_with_multiple_destinations_parallel(
-    source: Path,
-    destinations: list[Path],
-    buffer_size: int,
-    expected_size: int | None = None,
-    hash_algorithm: str | None = None,
-    keep_source: bool = True,
-) -> dict[str, Any]:
-    """
-    Copy source file to multiple destinations with true parallel writing.
-
-    This function implements genuine parallel I/O where multiple writer threads
-    simultaneously write chunks to different destinations while a reader thread
-    feeds data to all writers through queues.
-
-    Parameters
-    ----------
-    source : Path
-        Source file path
-    destinations : list[Path]
-        List of destination paths
-    buffer_size : int
-        Buffer size for copying operations
-    expected_size : int | None
-        Expected file size for verification
-    hash_algorithm : str | None
-        Hash algorithm for verification
-    keep_source : bool
-        Whether to keep source file after copying
-
-    Returns
-    -------
-    dict[str, any]
-        Copy results including hash, speed, and success status
-
-    Raises
-    ------
-    FileNotFoundError
-        If source file doesn't exist
-    ValueError
-        If file size doesn't match expected
-    """
-    if not source.exists():
-        raise FileNotFoundError(f"Source file not found: {source}")
-
-    # Verify expected file size
-    actual_size = source.stat().st_size
-    if expected_size is not None and actual_size != expected_size:
-        raise ValueError(
-            f"File size mismatch: expected {expected_size}, got {actual_size}"
-        )
-
-    logging.info(f"copying {source}...")
-
-    # Initialize progress tracker
-    progress_tracker = ProgressTracker(actual_size)
-    results = {"success": True, "destinations": {}}
-
-    try:
-        # Create temporary files for all destinations
-        temp_files: dict[Path, Path] = {}
-        for dest in destinations:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            temp_file = dest.parent / f".{dest.name}.tmp"
-            temp_files[dest] = temp_file
-
-        # Initialize parallel writer
-        parallel_writer = ParallelWriter(
-            destinations, temp_files, progress_tracker, hash_algorithm
-        )
-        parallel_writer.open_files()
-
-        try:
-            # Start writer threads
-            writer_threads = parallel_writer.start_writers()
-
-            # Read source and distribute chunks to writers
-            chunk_id = 0
-            total_bytes_read = 0
-
-            with open(source, "rb") as src:
-                while chunk := src.read(buffer_size):
-                    chunk_data = ChunkData(chunk_id, chunk)
-                    parallel_writer.distribute_chunk(chunk_data)
-
-                    chunk_id += 1
-                    total_bytes_read += len(chunk)
-
-            # Stop all writer threads
-            parallel_writer.stop_writers(writer_threads)
-
-            # Check for write errors
-            if parallel_writer.write_errors:
-                results["success"] = False
-                for dest, error in parallel_writer.write_errors.items():
-                    results["destinations"][str(dest)] = f"Write error: {error}"
-                    logging.error(f"Write error for {dest}: {error}")
-                return results
-
-        finally:
-            parallel_writer.close_files()
-
-        # Verify and move files
-        for dest in destinations:
-            temp_file = temp_files[dest]
-
-            # Verify file size
-            if temp_file.stat().st_size != actual_size:
-                results["success"] = False
-                results["destinations"][str(dest)] = "File size mismatch"
-                continue
-
-            # Move to final destination
-            temp_file.rename(dest)
-            logging.info(
-                f"Copy completed successfully for destination file with file size check ({dest})"
-            )
-            results["destinations"][str(dest)] = "success"
-
-        # Calculate performance stats
-        duration, speed = progress_tracker.get_stats()
-        results["duration"] = duration
-        results["speed_mb_sec"] = speed
-
-        logging.info(
-            f"copy speed {actual_size} bytes in {duration:.5f} sec ({speed:.1f} MB/sec)"
-        )
-
-        # Get hash if it was calculated during reading
-        if hash_algorithm:
-            file_hash = parallel_writer.get_hash()
-            if file_hash:
-                logging.info(f"hash {hash_algorithm.upper()}:{file_hash}")
-                results["hash"] = file_hash
-
-        logging.info("moving files in place..")
-        logging.info("done.")
-
-        return results
-
-    except Exception as e:
-        # Clean up temp files on error
-        for temp_file in temp_files.values():
-            if temp_file.exists():
-                temp_file.unlink()
-        raise OSError(f"Copy operation failed: {e}")
-
-
-def copy_with_multiple_destinations(
-    source: Path,
-    destinations: list[Path],
-    buffer_size: int,
-    expected_size: int | None = None,
-    hash_algorithm: str | None = None,
-    keep_source: bool = True,
-) -> dict[str, Any]:
-    """
-    Copy source file to multiple destinations simultaneously.
-
-    Parameters
-    ----------
-    source : Path
-        Source file path
-    destinations : list[Path]
-        List of destination paths
-    buffer_size : int
-        Buffer size for copying operations
-    expected_size : int | None
-        Expected file size for verification
-    hash_algorithm : str | None
-        Hash algorithm for verification
-    keep_source : bool
-        Whether to keep source file after copying
-
-    Returns
-    -------
-    dict[str, any]
-        Copy results including hash, speed, and success status
-
-    Raises
-    ------
-    FileNotFoundError
-        If source file doesn't exist
-    ValueError
-        If file size doesn't match expected
-    """
-    if not source.exists():
-        raise FileNotFoundError(f"Source file not found: {source}")
-
-    # Verify expected file size
-    actual_size = source.stat().st_size
-    if expected_size is not None and actual_size != expected_size:
-        raise ValueError(
-            f"File size mismatch: expected {expected_size}, got {actual_size}"
-        )
-
-    logging.info(f"copying {source}...")
-
-    # Initialize progress tracker
-    progress_tracker = ProgressTracker(actual_size)
-
-    # Use parallel implementation for multiple destinations
-    if len(destinations) > 1:
-        return copy_with_multiple_destinations_parallel(
-            source=source,
-            destinations=destinations,
-            buffer_size=buffer_size,
-            expected_size=expected_size,
-            hash_algorithm=hash_algorithm,
-            keep_source=keep_source,
-        )
-
-    # For single destination, use simpler approach
-    results = {"success": True, "destinations": {}}
-
-    try:
-        # Create temporary files for all destinations
-        temp_files = {}
-        file_handles = {}
-
-        for dest in destinations:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            temp_file = dest.parent / f".{dest.name}.tmp"
-            temp_files[dest] = temp_file
-            file_handles[dest] = open(temp_file, "wb")
-
-        # Copy file data to all destinations
-        bytes_copied = 0
-        with open(source, "rb") as src:
-            while chunk := src.read(buffer_size):
-                # Write chunk to all destinations
-                for dest, handle in file_handles.items():
-                    handle.write(chunk)
-
-                bytes_copied += len(chunk)
-                progress_tracker.update(bytes_copied)
-
-        # Close all file handles
-        for handle in file_handles.values():
-            handle.close()
-
-        # Verify and move files
-        for dest in destinations:
-            temp_file = temp_files[dest]
-
-            # Verify file size
-            if temp_file.stat().st_size != actual_size:
-                results["success"] = False
-                results["destinations"][str(dest)] = "File size mismatch"
-                continue
-
-            # Move to final destination
-            temp_file.rename(dest)
-            logging.info(
-                f"Copy completed successfully for destination file with file size check ({dest})"
-            )
-            results["destinations"][str(dest)] = "success"
-
-        # Calculate performance stats
-        duration, speed = progress_tracker.get_stats()
-        results["duration"] = duration
-        results["speed_mb_sec"] = speed
-
-        logging.info(
-            f"copy speed {actual_size} bytes in {duration:.5f} sec ({speed:.1f} MB/sec)"
-        )
-
-        # Calculate hash if requested
-        if hash_algorithm:
-            hash_calc = HashCalculator(hash_algorithm)
-            file_hash = hash_calc.calculate(source, buffer_size)
-            logging.info(f"hash {hash_algorithm.upper()}:{file_hash}")
-            results["hash"] = file_hash
-
-        logging.info("moving files in place..")
-        logging.info("done.")
-
-        return results
-
-    except Exception as e:
-        # Clean up temp files on error
-        for temp_file in temp_files.values():
-            if temp_file.exists():
-                temp_file.unlink()
-
-        # Close any open file handles
-        for handle in file_handles.values():
-            if not handle.closed:
-                handle.close()
-
-        raise OSError(f"Copy operation failed: {e}")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -1348,7 +825,7 @@ def parse_arguments() -> argparse.Namespace:
         epilog="""
 Examples:
   %(prog)s -v -t xxh64be source.mov dest1.mov dest2.mov
-  %(prog)s -b 16777216 -f_size 1000000 -t md5 source.mov dest1.mov dest2.mov
+  %(prog)s -b 16777216 -t md5 source.mov dest1.mov dest2.mov
         """,
     )
 
@@ -1365,33 +842,6 @@ Examples:
         default=None,
         choices=["xxh64be", "md5", "sha1", "sha256"],
         help="Hash algorithm for verification (default: none)",
-    )
-
-    # Source verification
-    parser.add_argument(
-        "--source-verify",
-        type=str,
-        default="none",
-        choices=["none", "per_file", "after_all"],
-        help="Source verification mode: none (default), per_file (verify each file after copy), after_all (verify all files after all copies complete)",
-    )
-
-    # Keep source file
-    parser.add_argument(
-        "-k",
-        "--keep",
-        action="store_true",
-        default=True,
-        help="Keep source file after copying (default: True)",
-    )
-
-    # Expected file size
-    parser.add_argument(
-        "-f_size",
-        "--file-size",
-        type=int,
-        default=None,
-        help="Expected file size in bytes for verification",
     )
 
     # Buffer size
@@ -1415,48 +865,23 @@ Examples:
 
 
 def main() -> int:
-    """
-    Main function for pfndispatchcopy.
-
-    Returns
-    -------
-    int
-        Exit code (0 for success, 1 for failure)
-    """
+    """Main function for pfndispatchcopy."""
     try:
         args = parse_arguments()
 
+        # Create config
+        config = CopyConfig.from_args(args)
+
         # Setup logging
-        setup_logging(args.verbose)
+        setup_logging(config.verbose)
 
-        # Use PSTaskWrapper for unified file/directory handling
-        task_wrapper = PSTaskWrapper(verbose=args.verbose)
+        # Create task wrapper
+        task_wrapper = PSTaskWrapper(config)
 
-        # Convert source verification mode
-        verify_mode_map = {
-            "none": VerificationMode.NONE,
-            "per_file": VerificationMode.PER_FILE,
-            "after_all": VerificationMode.AFTER_ALL,
-        }
-        source_verify_mode = verify_mode_map.get(
-            args.source_verify, VerificationMode.NONE
-        )
-
-        # Source verification requires hash algorithm
-        if source_verify_mode != VerificationMode.NONE and not args.hash:
-            logging.warning(
-                "Source verification requires hash algorithm (-t). Disabling source verification."
-            )
-            source_verify_mode = VerificationMode.NONE
-
+        # Launch copy
         results = task_wrapper.launch_copy(
             source=args.source,
             destinations=args.destinations,
-            buffer_size=args.buffer_size,
-            expected_size=args.file_size,
-            hash_algorithm=args.hash,
-            keep_source=args.keep,
-            source_verification=source_verify_mode,
         )
 
         if results["success"]:
