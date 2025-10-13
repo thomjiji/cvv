@@ -583,7 +583,7 @@ def copy_file(
         raise OSError(f"Copy operation failed: {e}")
 
 
-class PSTaskWrapper:
+class CopyTaskWrapper:
     """
     Wrapper class that handles both file and directory copying operations.
 
@@ -876,7 +876,7 @@ def main() -> int:
         setup_logging(config.verbose)
 
         # Create task wrapper
-        task_wrapper = PSTaskWrapper(config)
+        task_wrapper = CopyTaskWrapper(config)
 
         # Launch copy
         results = task_wrapper.launch_copy(
