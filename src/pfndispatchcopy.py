@@ -51,7 +51,8 @@ class CopyConfig:
     """Configuration for file copy operations."""
 
     buffer_size: int = 8388608
-    hash_algorithm: str | None = None
+    hash_algorithm: str = "xxh64be"
+    source_verification: VerificationMode = VerificationMode.NONE
     verbose: bool = False
 
     def __post_init__(self):
@@ -59,18 +60,25 @@ class CopyConfig:
         if self.buffer_size <= 0:
             raise ValueError(f"Buffer size must be positive, got {self.buffer_size}")
 
-        if self.hash_algorithm is not None:
-            valid_algorithms = ["xxh64be", "md5", "sha1", "sha256"]
-            if self.hash_algorithm.lower() not in valid_algorithms:
-                raise ValueError(f"Invalid hash algorithm: {self.hash_algorithm}")
-            self.hash_algorithm = self.hash_algorithm.lower()
+        valid_algorithms = ["xxh64be", "md5", "sha1", "sha256"]
+        if self.hash_algorithm.lower() not in valid_algorithms:
+            raise ValueError(f"Invalid hash algorithm: {self.hash_algorithm}")
+        self.hash_algorithm = self.hash_algorithm.lower()
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "CopyConfig":
         """Create config from command-line arguments."""
+        verify_mode_map = {
+            "none": VerificationMode.NONE,
+            "per_file": VerificationMode.PER_FILE,
+            "after_all": VerificationMode.AFTER_ALL,
+        }
+        source_verify = verify_mode_map.get(args.source_verify, VerificationMode.NONE)
+
         return cls(
             buffer_size=args.buffer_size,
-            hash_algorithm=args.hash,
+            hash_algorithm=args.hash if args.hash else "xxh64be",
+            source_verification=source_verify,
             verbose=args.verbose,
         )
 
@@ -467,10 +475,13 @@ class ParallelWriter:
             threads.append(thread)
         return threads
 
-    def distribute_chunk(self, chunk: ChunkData) -> None:
-        """Distribute chunk to all writers and update hash."""
+    def update_hash(self, data: bytes) -> None:
+        """Update hash with chunk data."""
         if self.hasher is not None:
-            self.hasher.update(chunk.data)
+            self.hasher.update(data)
+
+    def distribute_chunk(self, chunk: ChunkData) -> None:
+        """Distribute chunk to all writers."""
         for dest in self.destinations:
             self.chunk_queues[dest].put(chunk)
 
@@ -495,6 +506,7 @@ def copy_file(
     source: Path,
     destinations: list[Path],
     config: CopyConfig,
+    source_verifier: SourceVerifier | None = None,
 ) -> dict[str, Any]:
     """Unified file copy function with parallel I/O."""
     if not source.exists():
@@ -530,6 +542,7 @@ def copy_file(
             with open(source, "rb") as src:
                 while chunk := src.read(config.buffer_size):
                     chunk_data = ChunkData(chunk_id, chunk)
+                    parallel_writer.update_hash(chunk_data.data)
                     parallel_writer.distribute_chunk(chunk_data)
                     chunk_id += 1
 
@@ -569,9 +582,43 @@ def copy_file(
 
         # Get hash if calculated
         file_hash = parallel_writer.get_hash()
-        if file_hash and config.hash_algorithm:
+        if file_hash:
             logging.info(f"hash {config.hash_algorithm.upper()}:{file_hash}")
             results["hash"] = file_hash
+
+        # Source verification if requested
+        if source_verifier and file_hash:
+            if config.source_verification == VerificationMode.PER_FILE:
+                # Immediate verification
+                logging.info("")
+                logging.info("=" * 60)
+                logging.info("Starting source verification...")
+                logging.info("=" * 60)
+
+                source_verifier.store_initial_hash(source, file_hash)
+                verify_result = source_verifier.verify_source(
+                    source, config.buffer_size
+                )
+                results["source_verified"] = verify_result.verified
+
+                if verify_result.verified:
+                    logging.info(f"✓ Source verified: {source.name}")
+                    logging.info("")
+                    logging.info("Source verification summary:")
+                    logging.info(f"  Verified: 1")
+                    logging.info(f"  Failed: 0")
+                else:
+                    logging.error(
+                        f"✗ Source verification FAILED: {source.name} - {verify_result.error}"
+                    )
+                    logging.info("")
+                    logging.info("Source verification summary:")
+                    logging.info(f"  Verified: 0")
+                    logging.info(f"  Failed: 1")
+                    results["success"] = False
+            elif config.source_verification == VerificationMode.AFTER_ALL:
+                # Store hash for later verification
+                source_verifier.store_initial_hash(source, file_hash)
 
         logging.info("done.")
         return results
@@ -690,6 +737,14 @@ class CopyTaskWrapper:
         """Copy directory structure to multiple destinations."""
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
 
+        # Initialize source verifier if needed
+        verifier = None
+        if self.config.source_verification != VerificationMode.NONE:
+            verifier = SourceVerifier(self.config.hash_algorithm)
+            logging.info(
+                f"Source verification enabled: {self.config.source_verification.value} mode"
+            )
+
         # Discover all files in source
         source_files = self.discover_files(source)
         self.total_files = len(source_files)
@@ -710,6 +765,10 @@ class CopyTaskWrapper:
             "total_files": self.total_files,
             "total_bytes": self.total_bytes,
             "file_results": {},
+            "source_verification_enabled": self.config.source_verification
+            != VerificationMode.NONE,
+            "source_verification_mode": self.config.source_verification.value,
+            "source_verification_results": {},
         }
 
         # Process each file
@@ -723,7 +782,16 @@ class CopyTaskWrapper:
                     source=source_file,
                     destinations=dest_files,
                     config=self.config,
+                    source_verifier=verifier,
                 )
+
+                # Store hash for later verification if needed
+                if (
+                    self.config.source_verification == VerificationMode.AFTER_ALL
+                    and verifier
+                    and file_result.get("hash")
+                ):
+                    verifier.store_initial_hash(source_file, file_result["hash"])
 
                 if file_result["success"]:
                     self.completed_files += 1
@@ -764,6 +832,52 @@ class CopyTaskWrapper:
             logging.warning(f"Failed files: {self.failed_files}")
             results["success"] = False
 
+        # Perform source verification after all files if needed
+        if (
+            self.config.source_verification == VerificationMode.AFTER_ALL
+            and verifier
+            and results["success"]
+        ):
+            logging.info("")
+            logging.info("=" * 60)
+            logging.info("Starting source verification for all files...")
+            logging.info("=" * 60)
+
+            verification_results = verifier.verify_all_sources(self.config.buffer_size)
+
+            for source_file, verify_result in verification_results.items():
+                rel_path = (
+                    source_file.relative_to(source)
+                    if source.is_dir()
+                    else source_file.name
+                )
+
+                if verify_result.verified:
+                    logging.info(f"✓ Source verified: {rel_path}")
+                else:
+                    logging.error(
+                        f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
+                    )
+                    results["success"] = False
+
+                results["source_verification_results"][str(source_file)] = {
+                    "verified": verify_result.verified,
+                    "error": verify_result.error,
+                    "initial_hash": verify_result.initial_hash,
+                    "final_hash": verify_result.final_source_hash,
+                }
+
+            # Summary
+            summary = verifier.get_summary()
+            logging.info("")
+            logging.info("Source verification summary:")
+            logging.info(f"  Verified: {summary['verified']}")
+            logging.info(f"  Failed: {summary['failed']}")
+            logging.info(f"  Pending: {summary['pending']}")
+
+            if summary["failed"] > 0:
+                results["success"] = False
+
         return results
 
     def launch_copy(
@@ -776,11 +890,50 @@ class CopyTaskWrapper:
         dest_paths = [Path(dest) for dest in destinations]
 
         if source_path.is_file():
-            return copy_file(
+            # File copy
+            verifier = None
+            if self.config.source_verification != VerificationMode.NONE:
+                verifier = SourceVerifier(self.config.hash_algorithm)
+
+            result = copy_file(
                 source=source_path,
                 destinations=dest_paths,
                 config=self.config,
+                source_verifier=verifier,
             )
+
+            # Perform AFTER_ALL verification for single file if needed
+            if (
+                self.config.source_verification == VerificationMode.AFTER_ALL
+                and verifier
+                and result.get("success")
+            ):
+                logging.info("")
+                logging.info("=" * 60)
+                logging.info("Starting source verification...")
+                logging.info("=" * 60)
+
+                verify_result = verifier.verify_source(
+                    source_path, self.config.buffer_size
+                )
+
+                if verify_result.verified:
+                    logging.info(f"✓ Source verified: {source_path.name}")
+                    result["source_verified"] = True
+                else:
+                    logging.error(
+                        f"✗ Source verification FAILED: {source_path.name} - {verify_result.error}"
+                    )
+                    result["success"] = False
+                    result["source_verified"] = False
+
+                # Summary
+                logging.info("")
+                logging.info("Source verification summary:")
+                logging.info(f"  Verified: {1 if verify_result.verified else 0}")
+                logging.info(f"  Failed: {0 if verify_result.verified else 1}")
+
+            return result
         elif source_path.is_dir():
             # Directory copy
             return self.copy_directory_structure(
@@ -839,9 +992,18 @@ Examples:
         "-t",
         "--hash",
         type=str,
-        default=None,
+        default="xxh64be",
         choices=["xxh64be", "md5", "sha1", "sha256"],
-        help="Hash algorithm for verification (default: none)",
+        help="Hash algorithm for verification (default: xxh64be)",
+    )
+
+    # Source verification
+    parser.add_argument(
+        "--source-verify",
+        type=str,
+        default="none",
+        choices=["none", "per_file", "after_all"],
+        help="Source verification mode: none (default), per_file (verify each file after copy), after_all (verify all files after all copies complete)",
     )
 
     # Buffer size
