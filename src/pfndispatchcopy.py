@@ -10,7 +10,6 @@ and multi-destination support for professional DIT workflows.
 import argparse
 import hashlib
 import logging
-import os
 import queue
 import sys
 import threading
@@ -490,7 +489,6 @@ def copy_with_source_verification(
     destinations: list[Path],
     buffer_size: int,
     hash_algorithm: str,
-    noflush_destinations: list[Path] | None = None,
     keep_source: bool = True,
 ) -> dict[str, any]:
     """
@@ -506,8 +504,6 @@ def copy_with_source_verification(
         Buffer size for copying
     hash_algorithm : str
         Hash algorithm for verification
-    noflush_destinations : list[Path] | None
-        Destinations to skip flushing
     keep_source : bool
         Whether to keep source file
 
@@ -521,7 +517,6 @@ def copy_with_source_verification(
         source=source,
         destinations=destinations,
         buffer_size=buffer_size,
-        noflush_destinations=noflush_destinations,
         hash_algorithm=hash_algorithm,
         keep_source=keep_source,
     )
@@ -675,7 +670,6 @@ class PSTaskWrapper:
         destinations: list[Path],
         buffer_size: int = 8388608,
         expected_size: int | None = None,
-        noflush_destinations: list[Path] | None = None,
         hash_algorithm: str | None = None,
         keep_source: bool = True,
         source_verification: VerificationMode | None = None,
@@ -693,8 +687,6 @@ class PSTaskWrapper:
             Buffer size for copying operations
         expected_size : Optional[int]
             Expected total size for verification (optional for directories)
-        noflush_destinations : list[Path] | None
-            Destinations to skip flushing for
         hash_algorithm : str | None
             Hash algorithm for verification
         keep_source : bool
@@ -707,9 +699,7 @@ class PSTaskWrapper:
         dict[str, any]
             Copy results including statistics and success status
         """
-        if noflush_destinations is None:
-            noflush_destinations = []
-
+        # Initialize result tracking
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
 
         # Initialize source verifier if needed
@@ -757,16 +747,7 @@ class PSTaskWrapper:
                 # Map to destination paths
                 dest_files = self.map_destinations(source_file, source, destinations)
 
-                # Determine which destinations should skip flush
-                noflush_for_file = []
-                for dest_file in dest_files:
-                    for noflush_dest in noflush_destinations:
-                        if dest_file == noflush_dest or dest_file.is_relative_to(
-                            noflush_dest
-                        ):
-                            noflush_for_file.append(dest_file)
-                            break
-
+                # Perform copy operation
                 # Copy file to all destinations
                 if source_verification == VerificationMode.PER_FILE and hash_algorithm:
                     # Copy with immediate source verification
@@ -775,7 +756,6 @@ class PSTaskWrapper:
                         destinations=dest_files,
                         buffer_size=buffer_size,
                         hash_algorithm=hash_algorithm,
-                        noflush_destinations=noflush_for_file,
                         keep_source=keep_source,
                     )
                 elif len(dest_files) > 1:
@@ -783,7 +763,6 @@ class PSTaskWrapper:
                         source=source_file,
                         destinations=dest_files,
                         buffer_size=buffer_size,
-                        noflush_destinations=noflush_for_file,
                         hash_algorithm=hash_algorithm,
                         keep_source=keep_source,
                     )
@@ -792,7 +771,6 @@ class PSTaskWrapper:
                         source=source_file,
                         destinations=dest_files,
                         buffer_size=buffer_size,
-                        noflush_destinations=noflush_for_file,
                         hash_algorithm=hash_algorithm,
                         keep_source=keep_source,
                     )
@@ -900,7 +878,6 @@ class PSTaskWrapper:
         destinations: list[Path | str],
         buffer_size: int = 8388608,
         expected_size: int | None = None,
-        noflush_destinations: list[Path | str] | None = None,
         hash_algorithm: str | None = None,
         keep_source: bool = True,
         source_verification: VerificationMode | None = None,
@@ -918,8 +895,6 @@ class PSTaskWrapper:
             Buffer size for copying operations
         expected_size : int | None
             Expected file/directory size for verification
-        noflush_destinations : list[Path | str] | None
-            Destinations to skip flushing for
         hash_algorithm : str | None
             Hash algorithm for verification
         keep_source : bool
@@ -935,7 +910,6 @@ class PSTaskWrapper:
         # Convert to Path objects
         source_path = Path(source)
         dest_paths = [Path(dest) for dest in destinations]
-        noflush_paths = [Path(dest) for dest in (noflush_destinations or [])]
 
         if source_verification is None:
             source_verification = VerificationMode.NONE
@@ -949,7 +923,6 @@ class PSTaskWrapper:
                     destinations=dest_paths,
                     buffer_size=buffer_size,
                     hash_algorithm=hash_algorithm,
-                    noflush_destinations=noflush_paths,
                     keep_source=keep_source,
                 )
             elif len(dest_paths) > 1:
@@ -958,7 +931,6 @@ class PSTaskWrapper:
                     destinations=dest_paths,
                     buffer_size=buffer_size,
                     expected_size=expected_size,
-                    noflush_destinations=noflush_paths,
                     hash_algorithm=hash_algorithm,
                     keep_source=keep_source,
                 )
@@ -968,7 +940,6 @@ class PSTaskWrapper:
                     destinations=dest_paths,
                     buffer_size=buffer_size,
                     expected_size=expected_size,
-                    noflush_destinations=noflush_paths,
                     hash_algorithm=hash_algorithm,
                     keep_source=keep_source,
                 )
@@ -979,7 +950,6 @@ class PSTaskWrapper:
                 destinations=dest_paths,
                 buffer_size=buffer_size,
                 expected_size=expected_size,
-                noflush_destinations=noflush_paths,
                 hash_algorithm=hash_algorithm,
                 keep_source=keep_source,
                 source_verification=source_verification,
@@ -993,7 +963,6 @@ def copy_file_to_destination(
     destination: Path,
     buffer_size: int,
     progress_tracker: ProgressTracker,
-    noflush: bool = False,
 ) -> bool:
     """
     Copy file to a single destination with progress tracking.
@@ -1008,8 +977,6 @@ def copy_file_to_destination(
         Buffer size for copying
     progress_tracker : ProgressTracker
         Progress tracker instance
-    noflush : bool
-        Whether to skip file system flush
 
     Returns
     -------
@@ -1039,10 +1006,6 @@ def copy_file_to_destination(
         if temp_file.stat().st_size != source.stat().st_size:
             raise OSError(f"File size mismatch for {destination}")
 
-        # Flush to disk if not disabled
-        if not noflush:
-            os.fsync(dst.fileno() if "dst" in locals() and not dst.closed else -1)
-
         # Atomically move temp file to final destination
         temp_file.rename(destination)
 
@@ -1063,7 +1026,6 @@ def copy_with_multiple_destinations_parallel(
     destinations: list[Path],
     buffer_size: int,
     expected_size: int | None = None,
-    noflush_destinations: list[Path] | None = None,
     hash_algorithm: str | None = None,
     keep_source: bool = True,
 ) -> dict[str, Any]:
@@ -1084,8 +1046,6 @@ def copy_with_multiple_destinations_parallel(
         Buffer size for copying operations
     expected_size : int | None
         Expected file size for verification
-    noflush_destinations : list[Path] | None
-        Destinations to skip flushing for
     hash_algorithm : str | None
         Hash algorithm for verification
     keep_source : bool
@@ -1112,9 +1072,6 @@ def copy_with_multiple_destinations_parallel(
         raise ValueError(
             f"File size mismatch: expected {expected_size}, got {actual_size}"
         )
-
-    if noflush_destinations is None:
-        noflush_destinations = []
 
     logging.info(f"copying {source}...")
 
@@ -1176,11 +1133,6 @@ def copy_with_multiple_destinations_parallel(
                 results["destinations"][str(dest)] = "File size mismatch"
                 continue
 
-            # Flush if not disabled
-            noflush = dest in noflush_destinations
-            if noflush:
-                logging.info(f'skipping flush for destination "{dest}"')
-
             # Move to final destination
             temp_file.rename(dest)
             logging.info(
@@ -1205,7 +1157,6 @@ def copy_with_multiple_destinations_parallel(
                 results["hash"] = file_hash
 
         logging.info("moving files in place..")
-        logging.info("flushing files")
         logging.info("done.")
 
         return results
@@ -1223,7 +1174,6 @@ def copy_with_multiple_destinations(
     destinations: list[Path],
     buffer_size: int,
     expected_size: int | None = None,
-    noflush_destinations: list[Path] | None = None,
     hash_algorithm: str | None = None,
     keep_source: bool = True,
 ) -> dict[str, Any]:
@@ -1240,8 +1190,6 @@ def copy_with_multiple_destinations(
         Buffer size for copying operations
     expected_size : int | None
         Expected file size for verification
-    noflush_destinations : list[Path] | None
-        Destinations to skip flushing for
     hash_algorithm : str | None
         Hash algorithm for verification
     keep_source : bool
@@ -1269,9 +1217,6 @@ def copy_with_multiple_destinations(
             f"File size mismatch: expected {expected_size}, got {actual_size}"
         )
 
-    if noflush_destinations is None:
-        noflush_destinations = []
-
     logging.info(f"copying {source}...")
 
     # Initialize progress tracker
@@ -1284,7 +1229,6 @@ def copy_with_multiple_destinations(
             destinations=destinations,
             buffer_size=buffer_size,
             expected_size=expected_size,
-            noflush_destinations=noflush_destinations,
             hash_algorithm=hash_algorithm,
             keep_source=keep_source,
         )
@@ -1328,11 +1272,6 @@ def copy_with_multiple_destinations(
                 results["destinations"][str(dest)] = "File size mismatch"
                 continue
 
-            # Flush if not disabled
-            noflush = dest in noflush_destinations
-            if noflush:
-                logging.info(f'skipping flush for destination "{dest}"')
-
             # Move to final destination
             temp_file.rename(dest)
             logging.info(
@@ -1357,7 +1296,6 @@ def copy_with_multiple_destinations(
             results["hash"] = file_hash
 
         logging.info("moving files in place..")
-        logging.info("flushing files")
         logging.info("done.")
 
         return results
@@ -1410,7 +1348,7 @@ def parse_arguments() -> argparse.Namespace:
         epilog="""
 Examples:
   %(prog)s -v -t xxh64be source.mov dest1.mov dest2.mov
-  %(prog)s -noflush_dest dest1.mov -b 16777216 -f_size 1000000 source.mov dest1.mov
+  %(prog)s -b 16777216 -f_size 1000000 -t md5 source.mov dest1.mov dest2.mov
         """,
     )
 
@@ -1465,14 +1403,6 @@ Examples:
         help="Buffer size in bytes (default: 8MB)",
     )
 
-    # No flush destinations
-    parser.add_argument(
-        "-noflush_dest",
-        action="append",
-        dest="noflush_destinations",
-        help="Destination path to skip flushing (can be used multiple times)",
-    )
-
     # Source file or directory (required)
     parser.add_argument("source", type=Path, help="Source file or directory path")
 
@@ -1499,11 +1429,6 @@ def main() -> int:
         # Setup logging
         setup_logging(args.verbose)
 
-        # Convert noflush destinations to Path objects
-        noflush_destinations = []
-        if args.noflush_destinations:
-            noflush_destinations = [Path(dest) for dest in args.noflush_destinations]
-
         # Use PSTaskWrapper for unified file/directory handling
         task_wrapper = PSTaskWrapper(verbose=args.verbose)
 
@@ -1529,7 +1454,6 @@ def main() -> int:
             destinations=args.destinations,
             buffer_size=args.buffer_size,
             expected_size=args.file_size,
-            noflush_destinations=noflush_destinations,
             hash_algorithm=args.hash,
             keep_source=args.keep,
             source_verification=source_verify_mode,

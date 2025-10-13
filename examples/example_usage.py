@@ -176,49 +176,10 @@ def example_with_hash_verification() -> None:
             logging.error("✗ Copy with hash verification failed")
 
 
-def example_with_noflush() -> None:
-    """Example 3: Copy with selective flush control."""
-    logging.info("=" * 60)
-    logging.info("EXAMPLE 3: Copy with selective flush control")
-    logging.info("=" * 60)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-
-        # Create sample source file
-        source_file = temp_path / "DJI" / "A013_VW5X15" / "A013C0002_251011_VW5X15.MOV"
-        create_sample_file(source_file, size_mb=2)
-
-        # Define destinations
-        dest1 = temp_path / "fast_ssd" / "project" / "A013C0002_251011_VW5X15.MOV"
-        dest2 = temp_path / "slow_hdd" / "project" / "A013C0002_251011_VW5X15.MOV"
-
-        # Run pfndispatchcopy with noflush for fast SSD
-        args = [
-            "-v",  # Verbose output
-            "-noflush_dest",
-            str(dest1),  # Skip flush for fast SSD
-            "-t",
-            "md5",  # Use MD5 hash (no xxhash dependency needed)
-            "-b",
-            "4194304",  # 4MB buffer size
-            str(source_file),
-            str(dest1),
-            str(dest2),
-        ]
-
-        exit_code = run_pfndispatchcopy(args)
-
-        if exit_code == 0:
-            logging.info("✓ Copy with selective flush control completed successfully")
-        else:
-            logging.error("✗ Copy with selective flush control failed")
-
-
 def example_large_file_simulation() -> None:
-    """Example 4: Simulate copying a large file (similar to the log example)."""
+    """Example 3: Simulate copying a large file (similar to the log example)."""
     logging.info("=" * 60)
-    logging.info("EXAMPLE 4: Large file copy simulation")
+    logging.info("EXAMPLE 3: Large file copy simulation")
     logging.info("=" * 60)
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -255,13 +216,9 @@ def example_large_file_simulation() -> None:
 
         file_size = source_file.stat().st_size
 
-        # Run pfndispatchcopy exactly like in the log
+        # Run pfndispatchcopy
         args = [
             "-v",  # Verbose output
-            "-noflush_dest",
-            str(dest1),  # No flush for first destination
-            "-noflush_dest",
-            str(dest2),  # No flush for second destination
             "-t",
             "sha256",  # Use SHA256 (no xxhash dependency)
             "-k",  # Keep source file
@@ -283,9 +240,9 @@ def example_large_file_simulation() -> None:
 
 
 def example_error_handling() -> None:
-    """Example 5: Demonstrate error handling."""
+    """Example 4: Demonstrate error handling."""
     logging.info("=" * 60)
-    logging.info("EXAMPLE 5: Error handling demonstration")
+    logging.info("EXAMPLE 4: Error handling demonstration")
     logging.info("=" * 60)
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -345,7 +302,6 @@ def main() -> None:
         # Run examples
         example_basic_copy()
         example_with_hash_verification()
-        example_with_noflush()
         example_large_file_simulation()
         example_error_handling()
 
