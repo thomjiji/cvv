@@ -605,16 +605,16 @@ def copy_file(
                     logging.info(f"✓ Source verified: {source.name}")
                     logging.info("")
                     logging.info("Source verification summary:")
-                    logging.info(f"  Verified: 1")
-                    logging.info(f"  Failed: 0")
+                    logging.info("  Verified: 1")
+                    logging.info("  Failed: 0")
                 else:
                     logging.error(
                         f"✗ Source verification FAILED: {source.name} - {verify_result.error}"
                     )
                     logging.info("")
                     logging.info("Source verification summary:")
-                    logging.info(f"  Verified: 0")
-                    logging.info(f"  Failed: 1")
+                    logging.info("  Verified: 0")
+                    logging.info("  Failed: 1")
                     results["success"] = False
             elif config.source_verification == VerificationMode.AFTER_ALL:
                 # Store hash for later verification
