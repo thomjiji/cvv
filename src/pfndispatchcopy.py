@@ -19,6 +19,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+# Buffer size constants
+BUFFER_SIZE_8MB = 8 * 1024 * 1024  # 8MB in bytes
+
 try:
     import importlib.util
 
@@ -50,7 +53,7 @@ class VerificationResult:
 class CopyConfig:
     """Configuration for file copy operations."""
 
-    buffer_size: int = 8388608
+    buffer_size: int = BUFFER_SIZE_8MB
     source_verification: VerificationMode = VerificationMode.NONE
     source_verification_hash: str = "xxh64be"
     verbose: bool = False
@@ -453,7 +456,7 @@ class HashCalculator:
                 "xxhash library not available. Install with: pip install xxhash"
             )
 
-    def calculate(self, file_path: Path, buffer_size: int = 8388608) -> str:
+    def calculate(self, file_path: Path, buffer_size: int = BUFFER_SIZE_8MB) -> str:
         """
         Calculate hash of file.
 
@@ -1068,7 +1071,7 @@ Examples:
         "-b",
         "--buffer-size",
         type=int,
-        default=8388608,
+        default=BUFFER_SIZE_8MB,
         help="Buffer size in bytes (default: 8MB)",
     )
 
