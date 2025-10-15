@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import xxhash
+    import importlib.util
 
-    has_xxhash = True
+    has_xxhash = importlib.util.find_spec("xxhash") is not None
 except ImportError:
     has_xxhash = False
 
@@ -51,8 +51,8 @@ class CopyConfig:
     """Configuration for file copy operations."""
 
     buffer_size: int = 8388608
-    hash_algorithm: str = "xxh64be"
     source_verification: VerificationMode = VerificationMode.NONE
+    source_verification_hash: str = "xxh64be"
     verbose: bool = False
 
     def __post_init__(self):
@@ -61,9 +61,9 @@ class CopyConfig:
             raise ValueError(f"Buffer size must be positive, got {self.buffer_size}")
 
         valid_algorithms = ["xxh64be", "md5", "sha1", "sha256"]
-        if self.hash_algorithm.lower() not in valid_algorithms:
-            raise ValueError(f"Invalid hash algorithm: {self.hash_algorithm}")
-        self.hash_algorithm = self.hash_algorithm.lower()
+        if self.source_verification_hash.lower() not in valid_algorithms:
+            raise ValueError(f"Invalid hash algorithm: {self.source_verification_hash}")
+        self.source_verification_hash = self.source_verification_hash.lower()
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "CopyConfig":
@@ -77,8 +77,8 @@ class CopyConfig:
 
         return cls(
             buffer_size=args.buffer_size,
-            hash_algorithm=args.hash if args.hash else "xxh64be",
             source_verification=source_verify,
+            source_verification_hash=args.source_verify_hash or "xxh64be",
             verbose=args.verbose,
         )
 
@@ -188,7 +188,7 @@ class SourceVerifier:
         """
         results = {}
 
-        for file_path in self.initial_hashes.keys():
+        for file_path in self.initial_hashes:
             result = self.verify_source(file_path, buffer_size)
             results[file_path] = result
 
@@ -269,7 +269,8 @@ class ProgressTracker:
 
             if time_threshold and (bytes_threshold or percentage_threshold):
                 logging.info(
-                    f"copied {bytes_copied:,} of {self.total_size:,} bytes ({current_percentage:.1f}%)"
+                    f"copied {bytes_copied:,} of {self.total_size:,} bytes "
+                    f"({current_percentage:.1f}%)"
                 )
                 self.last_update = current_time
                 self.last_percentage = current_percentage
@@ -338,6 +339,12 @@ class HashCalculator:
             If file doesn't exist
         """
         if self.algorithm == "xxh64be":
+            if not has_xxhash:
+                raise ValueError(
+                    "xxhash library not available. Install with: pip install xxhash"
+                )
+            import xxhash
+
             hasher = xxhash.xxh64()
         elif self.algorithm == "md5":
             hasher = hashlib.md5()
@@ -395,23 +402,15 @@ class ParallelWriter:
         self.total_bytes_written = 0
         self.write_lock = threading.Lock()
 
-        # Initialize hash calculator if requested
+        # Initialize hash calculator - always use xxh64be for data stream hashing
         self.hasher = None
-        if config.hash_algorithm:
-            if config.hash_algorithm == "xxh64be":
-                if not has_xxhash:
-                    raise ValueError(
-                        "xxhash library not available. Install with: pip install xxhash"
-                    )
-                self.hasher = xxhash.xxh64()
-            elif config.hash_algorithm == "md5":
-                self.hasher = hashlib.md5()
-            elif config.hash_algorithm == "sha1":
-                self.hasher = hashlib.sha1()
-            elif config.hash_algorithm == "sha256":
-                self.hasher = hashlib.sha256()
-            else:
-                raise ValueError(f"Unsupported hash algorithm: {config.hash_algorithm}")
+        if not has_xxhash:
+            raise ValueError(
+                "xxhash library not available. Install with: pip install xxhash"
+            )
+        import xxhash
+
+        self.hasher = xxhash.xxh64()
 
     def open_files(self) -> None:
         """Open all destination files for writing."""
@@ -518,10 +517,10 @@ def copy_file(
 
     progress_tracker = ProgressTracker(actual_size)
     results = {"success": True, "destinations": {}}
+    temp_files: dict[Path, Path] = {}
 
     try:
         # Create temporary files for all destinations
-        temp_files: dict[Path, Path] = {}
         for dest in destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
             temp_file = dest.parent / f".{dest.name}.tmp"
@@ -583,11 +582,11 @@ def copy_file(
         # Get hash if calculated
         file_hash = parallel_writer.get_hash()
         if file_hash:
-            logging.info(f"hash {config.hash_algorithm.upper()}:{file_hash}")
+            logging.info(f"hash XXH64BE:{file_hash}")
             results["hash"] = file_hash
 
         # Source verification if requested
-        if source_verifier and file_hash:
+        if source_verifier:
             if config.source_verification == VerificationMode.PER_FILE:
                 # Immediate verification
                 logging.info("")
@@ -595,7 +594,16 @@ def copy_file(
                 logging.info("Starting source verification...")
                 logging.info("=" * 60)
 
-                source_verifier.store_initial_hash(source, file_hash)
+                # Use streaming hash if verification algorithm matches, otherwise recalculate
+                if config.source_verification_hash == "xxh64be" and file_hash:
+                    # Reuse the hash we already calculated during streaming
+                    initial_hash = file_hash
+                else:
+                    # Calculate the initial hash using the source verification algorithm
+                    hash_calc = HashCalculator(config.source_verification_hash)
+                    initial_hash = hash_calc.calculate(source, config.buffer_size)
+
+                source_verifier.store_initial_hash(source, initial_hash)
                 verify_result = source_verifier.verify_source(
                     source, config.buffer_size
                 )
@@ -617,17 +625,25 @@ def copy_file(
                     logging.info("  Failed: 1")
                     results["success"] = False
             elif config.source_verification == VerificationMode.AFTER_ALL:
-                # Store hash for later verification
-                source_verifier.store_initial_hash(source, file_hash)
+                # Use streaming hash if verification algorithm matches, otherwise recalculate
+                if config.source_verification_hash == "xxh64be" and file_hash:
+                    # Reuse the hash we already calculated during streaming
+                    initial_hash = file_hash
+                else:
+                    # Calculate and store hash for later verification using source verification algorithm
+                    hash_calc = HashCalculator(config.source_verification_hash)
+                    initial_hash = hash_calc.calculate(source, config.buffer_size)
+                source_verifier.store_initial_hash(source, initial_hash)
 
         logging.info("done.")
         return results
 
     except Exception as e:
+        # Clean up temp files if they were created
         for temp_file in temp_files.values():
             if temp_file.exists():
                 temp_file.unlink()
-        raise OSError(f"Copy operation failed: {e}")
+        raise OSError(f"Copy operation failed: {e}") from e
 
 
 class CopyTaskWrapper:
@@ -692,7 +708,7 @@ class CopyTaskWrapper:
             Relative path from source root
         """
         if source_root.is_file():
-            return file_path.name
+            return Path(file_path.name)
         else:
             return file_path.relative_to(source_root)
 
@@ -740,7 +756,7 @@ class CopyTaskWrapper:
         # Initialize source verifier if needed
         verifier = None
         if self.config.source_verification != VerificationMode.NONE:
-            verifier = SourceVerifier(self.config.hash_algorithm)
+            verifier = SourceVerifier(self.config.source_verification_hash)
             logging.info(
                 f"Source verification enabled: {self.config.source_verification.value} mode"
             )
@@ -789,9 +805,22 @@ class CopyTaskWrapper:
                 if (
                     self.config.source_verification == VerificationMode.AFTER_ALL
                     and verifier
-                    and file_result.get("hash")
+                    and file_result.get("success")
                 ):
-                    verifier.store_initial_hash(source_file, file_result["hash"])
+                    # Use streaming hash if verification algorithm matches, otherwise recalculate
+                    if (
+                        self.config.source_verification_hash == "xxh64be"
+                        and file_result.get("hash")
+                    ):
+                        # Reuse the hash we already calculated during streaming
+                        initial_hash = file_result["hash"]
+                    else:
+                        # Calculate hash using source verification algorithm
+                        hash_calc = HashCalculator(self.config.source_verification_hash)
+                        initial_hash = hash_calc.calculate(
+                            source_file, self.config.buffer_size
+                        )
+                    verifier.store_initial_hash(source_file, initial_hash)
 
                 if file_result["success"]:
                     self.completed_files += 1
@@ -893,7 +922,7 @@ class CopyTaskWrapper:
             # File copy
             verifier = None
             if self.config.source_verification != VerificationMode.NONE:
-                verifier = SourceVerifier(self.config.hash_algorithm)
+                verifier = SourceVerifier(self.config.source_verification_hash)
 
             result = copy_file(
                 source=source_path,
@@ -977,8 +1006,9 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -v -t xxh64be source.mov dest1.mov dest2.mov
-  %(prog)s -b 16777216 -t md5 source.mov dest1.mov dest2.mov
+  %(prog)s -v source.mov dest1.mov dest2.mov
+  %(prog)s -b 16777216 --source-verify per_file \\
+    --source-verify-hash md5 source.mov dest1.mov dest2.mov
         """,
     )
 
@@ -987,23 +1017,24 @@ Examples:
         "-v", "--verbose", action="store_true", help="Enable verbose output"
     )
 
-    # Hash algorithm
-    parser.add_argument(
-        "-t",
-        "--hash",
-        type=str,
-        default="xxh64be",
-        choices=["xxh64be", "md5", "sha1", "sha256"],
-        help="Hash algorithm for verification (default: xxh64be)",
-    )
-
     # Source verification
     parser.add_argument(
         "--source-verify",
         type=str,
         default="none",
         choices=["none", "per_file", "after_all"],
-        help="Source verification mode: none (default), per_file (verify each file after copy), after_all (verify all files after all copies complete)",
+        help="Source verification mode: none (default), per_file (verify each "
+        "file after copy), after_all (verify all files after all copies complete)",
+    )
+
+    # Hash algorithm for source verification (only used when --source-verify is not 'none')
+    parser.add_argument(
+        "--source-verify-hash",
+        type=str,
+        default="xxh64be",
+        choices=["xxh64be", "md5", "sha1", "sha256"],
+        help="Hash algorithm for source verification (default: xxh64be). "
+        "Only used when --source-verify is enabled.",
     )
 
     # Buffer size
@@ -1028,6 +1059,7 @@ Examples:
 
 def main() -> int:
     """Main function for pfndispatchcopy."""
+    args = None
     try:
         args = parse_arguments()
 
@@ -1084,7 +1116,7 @@ def main() -> int:
         return 1
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
-        if args.verbose:
+        if args and args.verbose:
             import traceback
 
             traceback.print_exc()
