@@ -83,22 +83,58 @@ class CopyConfig:
         )
 
 
-class SourceVerifier:
-    """Handle source verification for copied files."""
+class SourceVerificationManager:
+    """Unified manager for all source verification workflows."""
 
-    def __init__(self, hash_algorithm: str) -> None:
+    def __init__(self, config: CopyConfig) -> None:
         """
-        Initialize source verifier.
+        Initialize source verification manager.
 
         Parameters
         ----------
-        hash_algorithm : str
-            Hash algorithm to use for verification
+        config : CopyConfig
+            Configuration containing verification settings
         """
-        self.hash_algorithm = hash_algorithm
+        self.config = config
+        self.mode = config.source_verification
+        self.hash_algorithm = config.source_verification_hash
+        self.buffer_size = config.buffer_size
         self.initial_hashes: dict[Path, str] = {}
         self.verification_results: dict[Path, VerificationResult] = {}
         self.lock = threading.Lock()
+
+    def should_verify(self) -> bool:
+        """
+        Check if any verification is enabled.
+
+        Returns
+        -------
+        bool
+            True if verification is enabled
+        """
+        return self.mode != VerificationMode.NONE
+
+    def should_verify_immediately(self) -> bool:
+        """
+        Check if we should verify immediately after each file.
+
+        Returns
+        -------
+        bool
+            True if PER_FILE mode is enabled
+        """
+        return self.mode == VerificationMode.PER_FILE
+
+    def should_verify_at_end(self) -> bool:
+        """
+        Check if we should verify at the end of all operations.
+
+        Returns
+        -------
+        bool
+            True if AFTER_ALL mode is enabled
+        """
+        return self.mode == VerificationMode.AFTER_ALL
 
     def store_initial_hash(self, file_path: Path, hash_value: str) -> None:
         """
@@ -114,8 +150,24 @@ class SourceVerifier:
         with self.lock:
             self.initial_hashes[file_path] = hash_value
 
+    def prepare_file_for_verification(self, file_path: Path) -> None:
+        """
+        Calculate and store initial hash for a file.
+
+        Parameters
+        ----------
+        file_path : Path
+            Path to the file to prepare for verification
+        """
+        if not self.should_verify():
+            return
+
+        hash_calc = HashCalculator(self.hash_algorithm)
+        initial_hash = hash_calc.calculate(file_path, self.buffer_size)
+        self.store_initial_hash(file_path, initial_hash)
+
     def verify_source(
-        self, file_path: Path, buffer_size: int = 8388608
+        self, file_path: Path, buffer_size: int | None = None
     ) -> VerificationResult:
         """
         Verify source file by recalculating its hash.
@@ -124,14 +176,17 @@ class SourceVerifier:
         ----------
         file_path : Path
             Path to source file
-        buffer_size : int
-            Buffer size for reading
+        buffer_size : int | None
+            Buffer size for reading (uses config default if None)
 
         Returns
         -------
         VerificationResult
             Verification result
         """
+        if buffer_size is None:
+            buffer_size = self.buffer_size
+
         if file_path not in self.initial_hashes:
             return VerificationResult(
                 file_path=file_path,
@@ -170,29 +225,95 @@ class SourceVerifier:
 
         return result
 
-    def verify_all_sources(
-        self, buffer_size: int = 8388608
-    ) -> dict[Path, VerificationResult]:
+    def verify_file_immediately(self, file_path: Path) -> VerificationResult | None:
         """
-        Verify all stored source files.
+        Perform immediate verification (PER_FILE mode).
 
         Parameters
         ----------
-        buffer_size : int
-            Buffer size for reading
+        file_path : Path
+            Path to the file to verify
+
+        Returns
+        -------
+        VerificationResult | None
+            Verification result or None if verification is not enabled
+        """
+        if not self.should_verify():
+            return None
+
+        logging.info("")
+        logging.info("=" * 60)
+        logging.info("Starting source verification...")
+        logging.info("=" * 60)
+
+        verify_result = self.verify_source(file_path, self.buffer_size)
+
+        if verify_result.verified:
+            logging.info(f"✓ Source verified: {file_path.name}")
+            logging.info("")
+            logging.info("Source verification summary:")
+            logging.info("  Verified: 1")
+            logging.info("  Failed: 0")
+        else:
+            logging.error(
+                f"✗ Source verification FAILED: {file_path.name} - "
+                f"{verify_result.error}"
+            )
+            logging.info("")
+            logging.info("Source verification summary:")
+            logging.info("  Verified: 0")
+            logging.info("  Failed: 1")
+
+        return verify_result
+
+    def verify_all_pending(
+        self, source_root: Path | None = None
+    ) -> dict[Path, VerificationResult]:
+        """
+        Verify all pending files (AFTER_ALL mode).
+
+        Parameters
+        ----------
+        source_root : Path | None
+            Root path for relative path calculation in logging
 
         Returns
         -------
         dict[Path, VerificationResult]
             Verification results for all files
         """
-        results = {}
+        if not self.verifier:
+            return {}
 
-        for file_path in self.initial_hashes:
-            result = self.verify_source(file_path, buffer_size)
-            results[file_path] = result
+        logging.info("")
+        logging.info("=" * 60)
+        logging.info("Starting source verification for all files...")
+        logging.info("=" * 60)
 
-        return results
+        verification_results = self.verifier.verify_all_sources(self.buffer_size)
+
+        for source_file, verify_result in verification_results.items():
+            if source_root and source_root.is_dir():
+                rel_path = source_file.relative_to(source_root)
+            else:
+                rel_path = source_file.name
+
+            if verify_result.verified:
+                logging.info(f"✓ Source verified: {rel_path}")
+            else:
+                logging.error(
+                    f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
+                )
+
+        summary = self.verifier.get_summary()
+        logging.info("")
+        logging.info("Source verification summary:")
+        logging.info(f"  Verified: {summary['verified']}")
+        logging.info(f"  Failed: {summary['failed']}")
+        logging.info(f"  Pending: {summary['pending']}")
+
+        return verification_results
 
     def get_summary(self) -> dict[str, int]:
         """
@@ -203,16 +324,9 @@ class SourceVerifier:
         dict[str, int]
             Summary with counts of verified, failed, and pending
         """
-        verified = sum(1 for r in self.verification_results.values() if r.verified)
-        failed = sum(1 for r in self.verification_results.values() if not r.verified)
-        pending = len(self.initial_hashes) - len(self.verification_results)
-
-        return {
-            "verified": verified,
-            "failed": failed,
-            "pending": pending,
-            "total": len(self.initial_hashes),
-        }
+        if not self.verifier:
+            return {"verified": 0, "failed": 0, "pending": 0, "total": 0}
+        return self.verifier.get_summary()
 
 
 class ProgressTracker:
@@ -448,7 +562,8 @@ class ParallelWriter:
                     # Update progress (thread-safe)
                     with self.write_lock:
                         self.chunks_written[destination] += 1
-                        # Only update progress when all destinations have written this chunk
+                        # Only update progress when all destinations have
+                        # written this chunk
                         min_chunks = min(self.chunks_written.values())
                         expected_bytes = min_chunks * len(chunk.data)
                         if expected_bytes > self.total_bytes_written:
@@ -505,7 +620,7 @@ def copy_file(
     source: Path,
     destinations: list[Path],
     config: CopyConfig,
-    source_verifier: SourceVerifier | None = None,
+    verification_manager: SourceVerificationManager | None = None,
 ) -> dict[str, Any]:
     """Unified file copy function with parallel I/O."""
     if not source.exists():
@@ -586,54 +701,15 @@ def copy_file(
             results["hash"] = file_hash
 
         # Source verification if requested
-        if source_verifier:
-            if config.source_verification == VerificationMode.PER_FILE:
-                # Immediate verification
-                logging.info("")
-                logging.info("=" * 60)
-                logging.info("Starting source verification...")
-                logging.info("=" * 60)
+        if verification_manager and verification_manager.should_verify():
+            verification_manager.prepare_file_for_verification(source)
 
-                # Use streaming hash if verification algorithm matches, otherwise recalculate
-                if config.source_verification_hash == "xxh64be" and file_hash:
-                    # Reuse the hash we already calculated during streaming
-                    initial_hash = file_hash
-                else:
-                    # Calculate the initial hash using the source verification algorithm
-                    hash_calc = HashCalculator(config.source_verification_hash)
-                    initial_hash = hash_calc.calculate(source, config.buffer_size)
-
-                source_verifier.store_initial_hash(source, initial_hash)
-                verify_result = source_verifier.verify_source(
-                    source, config.buffer_size
-                )
-                results["source_verified"] = verify_result.verified
-
-                if verify_result.verified:
-                    logging.info(f"✓ Source verified: {source.name}")
-                    logging.info("")
-                    logging.info("Source verification summary:")
-                    logging.info("  Verified: 1")
-                    logging.info("  Failed: 0")
-                else:
-                    logging.error(
-                        f"✗ Source verification FAILED: {source.name} - {verify_result.error}"
-                    )
-                    logging.info("")
-                    logging.info("Source verification summary:")
-                    logging.info("  Verified: 0")
-                    logging.info("  Failed: 1")
-                    results["success"] = False
-            elif config.source_verification == VerificationMode.AFTER_ALL:
-                # Use streaming hash if verification algorithm matches, otherwise recalculate
-                if config.source_verification_hash == "xxh64be" and file_hash:
-                    # Reuse the hash we already calculated during streaming
-                    initial_hash = file_hash
-                else:
-                    # Calculate and store hash for later verification using source verification algorithm
-                    hash_calc = HashCalculator(config.source_verification_hash)
-                    initial_hash = hash_calc.calculate(source, config.buffer_size)
-                source_verifier.store_initial_hash(source, initial_hash)
+            if verification_manager.should_verify_immediately():
+                verify_result = verification_manager.verify_file_immediately(source)
+                if verify_result:
+                    results["source_verified"] = verify_result.verified
+                    if not verify_result.verified:
+                        results["success"] = False
 
         logging.info("done.")
         return results
@@ -664,7 +740,7 @@ class CopyTaskWrapper:
         self.failed_files = 0
         self.total_bytes = 0
         self.copied_bytes = 0
-        self.source_verifier: SourceVerifier | None = None
+        self.verification_manager = SourceVerificationManager(config)
 
     def discover_files(self, source_path: Path) -> list[Path]:
         """
@@ -753,13 +829,9 @@ class CopyTaskWrapper:
         """Copy directory structure to multiple destinations."""
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
 
-        # Initialize source verifier if needed
-        verifier = None
-        if self.config.source_verification != VerificationMode.NONE:
-            verifier = SourceVerifier(self.config.source_verification_hash)
-            logging.info(
-                f"Source verification enabled: {self.config.source_verification.value} mode"
-            )
+        if self.verification_manager.should_verify():
+            mode = self.config.source_verification.value
+            logging.info(f"Source verification enabled: {mode} mode")
 
         # Discover all files in source
         source_files = self.discover_files(source)
@@ -781,8 +853,7 @@ class CopyTaskWrapper:
             "total_files": self.total_files,
             "total_bytes": self.total_bytes,
             "file_results": {},
-            "source_verification_enabled": self.config.source_verification
-            != VerificationMode.NONE,
+            "source_verification_enabled": self.verification_manager.should_verify(),
             "source_verification_mode": self.config.source_verification.value,
             "source_verification_results": {},
         }
@@ -798,36 +869,14 @@ class CopyTaskWrapper:
                     source=source_file,
                     destinations=dest_files,
                     config=self.config,
-                    source_verifier=verifier,
+                    verification_manager=self.verification_manager,
                 )
-
-                # Store hash for later verification if needed
-                if (
-                    self.config.source_verification == VerificationMode.AFTER_ALL
-                    and verifier
-                    and file_result.get("success")
-                ):
-                    # Use streaming hash if verification algorithm matches, otherwise recalculate
-                    if (
-                        self.config.source_verification_hash == "xxh64be"
-                        and file_result.get("hash")
-                    ):
-                        # Reuse the hash we already calculated during streaming
-                        initial_hash = file_result["hash"]
-                    else:
-                        # Calculate hash using source verification algorithm
-                        hash_calc = HashCalculator(self.config.source_verification_hash)
-                        initial_hash = hash_calc.calculate(
-                            source_file, self.config.buffer_size
-                        )
-                    verifier.store_initial_hash(source_file, initial_hash)
 
                 if file_result["success"]:
                     self.completed_files += 1
                     results["files_copied"] += 1
-                    logging.info(
-                        f"✓ Copied {source_file.name} ({self.completed_files}/{self.total_files})"
-                    )
+                    progress = f"{self.completed_files}/{self.total_files}"
+                    logging.info(f"✓ Copied {source_file.name} ({progress})")
                 else:
                     self.failed_files += 1
                     results["files_failed"] += 1
@@ -853,8 +902,9 @@ class CopyTaskWrapper:
             else 0
         )
 
+        progress = f"{self.completed_files}/{self.total_files}"
         logging.info(
-            f"Directory copy completed: {self.completed_files}/{self.total_files} files ({success_rate:.1f}%)"
+            f"Directory copy completed: {progress} files ({success_rate:.1f}%)"
         )
 
         if self.failed_files > 0:
@@ -862,31 +912,11 @@ class CopyTaskWrapper:
             results["success"] = False
 
         # Perform source verification after all files if needed
-        if (
-            self.config.source_verification == VerificationMode.AFTER_ALL
-            and verifier
-            and results["success"]
-        ):
-            logging.info("")
-            logging.info("=" * 60)
-            logging.info("Starting source verification for all files...")
-            logging.info("=" * 60)
-
-            verification_results = verifier.verify_all_sources(self.config.buffer_size)
+        if self.verification_manager.should_verify_at_end() and results["success"]:
+            verification_results = self.verification_manager.verify_all_pending(source)
 
             for source_file, verify_result in verification_results.items():
-                rel_path = (
-                    source_file.relative_to(source)
-                    if source.is_dir()
-                    else source_file.name
-                )
-
-                if verify_result.verified:
-                    logging.info(f"✓ Source verified: {rel_path}")
-                else:
-                    logging.error(
-                        f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
-                    )
+                if not verify_result.verified:
                     results["success"] = False
 
                 results["source_verification_results"][str(source_file)] = {
@@ -896,14 +926,7 @@ class CopyTaskWrapper:
                     "final_hash": verify_result.final_source_hash,
                 }
 
-            # Summary
-            summary = verifier.get_summary()
-            logging.info("")
-            logging.info("Source verification summary:")
-            logging.info(f"  Verified: {summary['verified']}")
-            logging.info(f"  Failed: {summary['failed']}")
-            logging.info(f"  Pending: {summary['pending']}")
-
+            summary = self.verification_manager.get_summary()
             if summary["failed"] > 0:
                 results["success"] = False
 
@@ -920,47 +943,25 @@ class CopyTaskWrapper:
 
         if source_path.is_file():
             # File copy
-            verifier = None
-            if self.config.source_verification != VerificationMode.NONE:
-                verifier = SourceVerifier(self.config.source_verification_hash)
-
             result = copy_file(
                 source=source_path,
                 destinations=dest_paths,
                 config=self.config,
-                source_verifier=verifier,
+                verification_manager=self.verification_manager,
             )
 
             # Perform AFTER_ALL verification for single file if needed
-            if (
-                self.config.source_verification == VerificationMode.AFTER_ALL
-                and verifier
-                and result.get("success")
+            if self.verification_manager.should_verify_at_end() and result.get(
+                "success"
             ):
-                logging.info("")
-                logging.info("=" * 60)
-                logging.info("Starting source verification...")
-                logging.info("=" * 60)
+                verification_results = self.verification_manager.verify_all_pending()
 
-                verify_result = verifier.verify_source(
-                    source_path, self.config.buffer_size
-                )
+                if verification_results:
+                    verify_result = list(verification_results.values())[0]
+                    result["source_verified"] = verify_result.verified
 
-                if verify_result.verified:
-                    logging.info(f"✓ Source verified: {source_path.name}")
-                    result["source_verified"] = True
-                else:
-                    logging.error(
-                        f"✗ Source verification FAILED: {source_path.name} - {verify_result.error}"
-                    )
-                    result["success"] = False
-                    result["source_verified"] = False
-
-                # Summary
-                logging.info("")
-                logging.info("Source verification summary:")
-                logging.info(f"  Verified: {1 if verify_result.verified else 0}")
-                logging.info(f"  Failed: {0 if verify_result.verified else 1}")
+                    if not verify_result.verified:
+                        result["success"] = False
 
             return result
         elif source_path.is_dir():
@@ -1027,7 +1028,8 @@ Examples:
         "file after copy), after_all (verify all files after all copies complete)",
     )
 
-    # Hash algorithm for source verification (only used when --source-verify is not 'none')
+    # Hash algorithm for source verification
+    # (only used when --source-verify is not 'none')
     parser.add_argument(
         "--source-verify-hash",
         type=str,
@@ -1081,8 +1083,9 @@ def main() -> int:
         if results["success"]:
             if "files_copied" in results:
                 # Directory copy results
+                file_count = results["files_copied"]
                 logging.info(
-                    f"All copy operations completed successfully ({results['files_copied']} files)"
+                    f"All copy operations completed successfully ({file_count} files)"
                 )
             else:
                 # File copy results
