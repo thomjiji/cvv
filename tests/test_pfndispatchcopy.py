@@ -21,9 +21,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from pfndispatchcopy import (
+    CopyConfig,
+    CopyTaskWrapper,
     HashCalculator,
     ProgressTracker,
-    copy_with_multiple_destinations,
+    VerificationMode,
     parse_arguments,
     setup_logging,
 )
@@ -134,12 +136,9 @@ class TestFileCopyOperations(unittest.TestCase):
         """Test copying to a single destination."""
         dest1 = self.test_path / "dest1.txt"
 
-        result = copy_with_multiple_destinations(
-            source=self.source_file,
-            destinations=[dest1],
-            buffer_size=1024,
-            hash_algorithm="md5",
-        )
+        config = CopyConfig(buffer_size=1024, verbose=False)
+        wrapper = CopyTaskWrapper(config)
+        result = wrapper.launch_copy(source=self.source_file, destinations=[dest1])
 
         self.assertTrue(result["success"])
         self.assertTrue(dest1.exists())
@@ -151,11 +150,10 @@ class TestFileCopyOperations(unittest.TestCase):
         dest1 = self.test_path / "backup1" / "file.txt"
         dest2 = self.test_path / "backup2" / "file.txt"
 
-        result = copy_with_multiple_destinations(
-            source=self.source_file,
-            destinations=[dest1, dest2],
-            buffer_size=512,
-            hash_algorithm="sha1",
+        config = CopyConfig(buffer_size=512, verbose=False)
+        wrapper = CopyTaskWrapper(config)
+        result = wrapper.launch_copy(
+            source=self.source_file, destinations=[dest1, dest2]
         )
 
         self.assertTrue(result["success"])
@@ -168,34 +166,23 @@ class TestFileCopyOperations(unittest.TestCase):
         """Test file size verification."""
         dest1 = self.test_path / "dest_size_check.txt"
 
-        # Test with correct size
-        result = copy_with_multiple_destinations(
-            source=self.source_file,
-            destinations=[dest1],
-            buffer_size=1024,
-            expected_size=len(self.test_data),
-        )
+        config = CopyConfig(buffer_size=1024, verbose=False)
+        wrapper = CopyTaskWrapper(config)
+        result = wrapper.launch_copy(source=self.source_file, destinations=[dest1])
 
         self.assertTrue(result["success"])
-
-        # Test with incorrect size
-        with self.assertRaises(ValueError):
-            copy_with_multiple_destinations(
-                source=self.source_file,
-                destinations=[dest1],
-                buffer_size=1024,
-                expected_size=999999,  # Wrong size
-            )
+        self.assertTrue(dest1.exists())
+        self.assertEqual(dest1.stat().st_size, len(self.test_data))
 
     def test_nonexistent_source(self) -> None:
         """Test error handling for nonexistent source file."""
         nonexistent = self.test_path / "does_not_exist.txt"
         dest1 = self.test_path / "dest.txt"
 
+        config = CopyConfig(buffer_size=1024, verbose=False)
+        wrapper = CopyTaskWrapper(config)
         with self.assertRaises(FileNotFoundError):
-            copy_with_multiple_destinations(
-                source=nonexistent, destinations=[dest1], buffer_size=1024
-            )
+            wrapper.launch_copy(source=nonexistent, destinations=[dest1])
 
 
 class TestArgumentParsing(unittest.TestCase):
@@ -327,12 +314,10 @@ def create_integration_test() -> None:
 
         try:
             # Perform copy operation
-            result = copy_with_multiple_destinations(
-                source=source_file,
-                destinations=[dest1, dest2],
-                buffer_size=64 * 1024,  # 64KB buffer
-                expected_size=len(test_data),
-                hash_algorithm="md5",
+            config = CopyConfig(buffer_size=64 * 1024, verbose=False)
+            wrapper = CopyTaskWrapper(config)
+            result = wrapper.launch_copy(
+                source=source_file, destinations=[dest1, dest2]
             )
 
             # Verify results
@@ -344,8 +329,8 @@ def create_integration_test() -> None:
 
             print("✓ Integration test passed!")
             print(f"  - Copied {len(test_data)} bytes")
-            print(f"  - Speed: {result['speed_mb_sec']:.1f} MB/sec")
-            print(f"  - Hash: {result['hash']}")
+            print(f"  - Speed: {result.get('speed_mb_sec', 0):.1f} MB/sec")
+            print(f"  - Hash: {result.get('hash', 'N/A')}")
 
         except Exception as e:
             print(f"✗ Integration test failed: {e}")

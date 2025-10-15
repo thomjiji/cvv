@@ -267,6 +267,23 @@ class SourceVerificationManager:
 
         return verify_result
 
+    def verify_all_sources(self) -> dict[Path, VerificationResult]:
+        """
+        Verify all stored source files.
+
+        Returns
+        -------
+        dict[Path, VerificationResult]
+            Verification results for all files
+        """
+        results = {}
+
+        for file_path in self.initial_hashes:
+            result = self.verify_source(file_path, self.buffer_size)
+            results[file_path] = result
+
+        return results
+
     def verify_all_pending(
         self, source_root: Path | None = None
     ) -> dict[Path, VerificationResult]:
@@ -283,7 +300,7 @@ class SourceVerificationManager:
         dict[Path, VerificationResult]
             Verification results for all files
         """
-        if not self.verifier:
+        if not self.should_verify():
             return {}
 
         logging.info("")
@@ -291,7 +308,7 @@ class SourceVerificationManager:
         logging.info("Starting source verification for all files...")
         logging.info("=" * 60)
 
-        verification_results = self.verifier.verify_all_sources(self.buffer_size)
+        verification_results = self.verify_all_sources()
 
         for source_file, verify_result in verification_results.items():
             if source_root and source_root.is_dir():
@@ -306,7 +323,7 @@ class SourceVerificationManager:
                     f"✗ Source verification FAILED: {rel_path} - {verify_result.error}"
                 )
 
-        summary = self.verifier.get_summary()
+        summary = self.get_summary()
         logging.info("")
         logging.info("Source verification summary:")
         logging.info(f"  Verified: {summary['verified']}")
@@ -324,9 +341,16 @@ class SourceVerificationManager:
         dict[str, int]
             Summary with counts of verified, failed, and pending
         """
-        if not self.verifier:
-            return {"verified": 0, "failed": 0, "pending": 0, "total": 0}
-        return self.verifier.get_summary()
+        verified = sum(1 for r in self.verification_results.values() if r.verified)
+        failed = sum(1 for r in self.verification_results.values() if not r.verified)
+        pending = len(self.initial_hashes) - len(self.verification_results)
+
+        return {
+            "verified": verified,
+            "failed": failed,
+            "pending": pending,
+            "total": len(self.initial_hashes),
+        }
 
 
 class ProgressTracker:
