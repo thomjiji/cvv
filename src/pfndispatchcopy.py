@@ -359,7 +359,9 @@ class SourceVerificationManager:
 class ProgressTracker:
     """Track and report copy progress across multiple threads."""
 
-    def __init__(self, total_size: int, update_interval: float = 2.0) -> None:
+    def __init__(
+        self, total_size: int, source_path: Path, update_interval: float = 2.0
+    ) -> None:
         """
         Initialize progress tracker.
 
@@ -367,19 +369,27 @@ class ProgressTracker:
         ----------
         total_size : int
             Total file size in bytes
+        source_path : Path
+            Path to the source file
         update_interval : float
             Interval between progress updates in seconds
         """
         self.total_size = total_size
+        self.source_path = source_path
         self.update_interval = update_interval
         self.bytes_copied = 0
-        self.start_time = time.time()
+        self.start_time = 0.0
         self.last_update = 0
         self.last_percentage = 0
         self.min_bytes_threshold = max(
             1024 * 1024 * 10, total_size // 50
         )  # 10MB or 2% of file
         self.lock = threading.Lock()
+
+    def start(self) -> None:
+        """Log the start of the copy operation."""
+        logging.info(f"copying {self.source_path}...")
+        self.start_time = time.time()
 
     def update(self, bytes_copied: int) -> None:
         """
@@ -430,6 +440,16 @@ class ProgressTracker:
             (self.total_size / (1024 * 1024)) / duration if duration > 0 else 0
         )
         return duration, speed_mb_sec
+
+    def finish(self, file_hash: str | None = None) -> None:
+        """Log the completion of the copy operation and final stats."""
+        duration, speed_mb_sec = self.get_stats()
+        logging.info(
+            f"copy speed {self.total_size} bytes in {duration:.5f} sec ({speed_mb_sec:.1f} MB/sec)"
+        )
+        if file_hash:
+            logging.info(f"hash XXH64BE:{file_hash}")
+        logging.info("done.")
 
 
 class HashCalculator:
@@ -655,9 +675,9 @@ def copy_file(
 
     actual_size = source.stat().st_size
 
-    logging.info(f"copying {source}...")
+    progress_tracker = ProgressTracker(actual_size, source)
+    progress_tracker.start()
 
-    progress_tracker = ProgressTracker(actual_size)
     results = {"success": True, "destinations": {}}
     temp_files: dict[Path, Path] = {}
 
@@ -694,7 +714,9 @@ def copy_file(
             if parallel_writer.write_errors:
                 results["success"] = False
                 for dest, error in parallel_writer.write_errors.items():
-                    results["destinations"][str(dest)] = f"Write error: {error}"
+                    results["destinations"][
+                        str(dest)
+                    ] = f"Write error: {error}"
                     logging.error(f"Write error for {dest}: {error}")
                 return results
 
@@ -713,18 +735,14 @@ def copy_file(
             logging.info(f"Copy completed successfully: {dest}")
             results["destinations"][str(dest)] = "success"
 
-        # Calculate performance stats
+        # Finalize progress and get stats
+        file_hash = parallel_writer.get_hash()
+        progress_tracker.finish(file_hash)
+
         duration, speed = progress_tracker.get_stats()
         results["duration"] = duration
         results["speed_mb_sec"] = speed
-        logging.info(
-            f"copy speed {actual_size} bytes in {duration:.5f} sec ({speed:.1f} MB/sec)"
-        )
-
-        # Get hash if calculated
-        file_hash = parallel_writer.get_hash()
         if file_hash:
-            logging.info(f"hash XXH64BE:{file_hash}")
             results["hash"] = file_hash
 
         # Source verification if requested
@@ -738,7 +756,6 @@ def copy_file(
                     if not verify_result.verified:
                         results["success"] = False
 
-        logging.info("done.")
         return results
 
     except Exception as e:
