@@ -523,22 +523,12 @@ class HashCalculator:
         return hasher.hexdigest()
 
 
+@dataclass
 class ChunkData:
     """Data structure for passing chunks between threads."""
 
-    def __init__(self, chunk_id: int, data: bytes) -> None:
-        """
-        Initialize chunk data.
-
-        Parameters
-        ----------
-        chunk_id : int
-            Sequential ID of this chunk
-        data : bytes
-            The actual chunk data
-        """
-        self.chunk_id = chunk_id
-        self.data = data
+    chunk_id: int
+    data: bytes
 
 
 class ParallelWriter:
@@ -714,9 +704,7 @@ def copy_file(
             if parallel_writer.write_errors:
                 results["success"] = False
                 for dest, error in parallel_writer.write_errors.items():
-                    results["destinations"][
-                        str(dest)
-                    ] = f"Write error: {error}"
+                    results["destinations"][str(dest)] = f"Write error: {error}"
                     logging.error(f"Write error for {dest}: {error}")
                 return results
 
