@@ -1075,11 +1075,11 @@ def main() -> int:
     try:
         args = parse_arguments()
 
+        # Setup logging
+        setup_logging(args.verbose)
+
         # Create config
         config = CopyConfig.from_args(args)
-
-        # Setup logging
-        setup_logging(config.verbose)
 
         # Create task wrapper
         task_wrapper = CopyTaskWrapper(config)
