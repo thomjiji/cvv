@@ -19,15 +19,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import xxhash
+
 # Buffer size constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB in bytes
-
-try:
-    import importlib.util
-
-    has_xxhash = importlib.util.find_spec("xxhash") is not None
-except ImportError:
-    has_xxhash = False
 
 
 class VerificationMode(Enum):
@@ -559,7 +554,6 @@ class ParallelWriter:
             raise ValueError(
                 "xxhash library not available. Install with: pip install xxhash"
             )
-        import xxhash
 
         self.hasher = xxhash.xxh64()
 
