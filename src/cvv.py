@@ -19,7 +19,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import xxhash
+try:
+    import xxhash
+except ImportError:
+    logging.error("The 'xxhash' library is required but not installed.")
+    logging.error("Please install it using: pip install xxhash")
+    import sys
+
+    sys.exit(1)
 
 # Buffer size constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB in bytes
@@ -466,11 +473,6 @@ class HashCalculator:
         """
         self.algorithm = algorithm.lower()
 
-        if self.algorithm == "xxh64be" and not has_xxhash:
-            raise ValueError(
-                "xxhash library not available. Install with: pip install xxhash"
-            )
-
     def calculate(self, file_path: Path, buffer_size: int = BUFFER_SIZE) -> str:
         """
         Calculate hash of file.
@@ -495,12 +497,6 @@ class HashCalculator:
             If file doesn't exist
         """
         if self.algorithm == "xxh64be":
-            if not has_xxhash:
-                raise ValueError(
-                    "xxhash library not available. Install with: pip install xxhash"
-                )
-            import xxhash
-
             hasher = xxhash.xxh64()
         elif self.algorithm == "md5":
             hasher = hashlib.md5()
@@ -549,12 +545,6 @@ class ParallelWriter:
         self.write_lock = threading.Lock()
 
         # Initialize hash calculator - always use xxh64be for data stream hashing
-        self.hasher = None
-        if not has_xxhash:
-            raise ValueError(
-                "xxhash library not available. Install with: pip install xxhash"
-            )
-
         self.hasher = xxhash.xxh64()
 
     def open_files(self) -> None:
