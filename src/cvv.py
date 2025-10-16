@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pfndispatchcopy - Professional file copying tool with integrity verification.
+cvv - Professional file copying tool with integrity verification.
 
 This tool implements the core functionality of Offload Manager's pfndispatchcopy,
 providing reliable file copying with hash verification, progress monitoring,
@@ -1086,7 +1086,7 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Main function for pfndispatchcopy."""
+    """Main function for cvv."""
     args = None
     try:
         args = parse_arguments()

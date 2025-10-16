@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Command-line entry point for pfndispatchcopy.
+Command-line entry point for cvv.
 
-This script provides a convenient command-line interface to the pfndispatchcopy
+This script provides a convenient command-line interface to the cvv
 tool without requiring users to specify the full path to the Python module.
 """
 
@@ -14,7 +14,7 @@ src_dir = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_dir))
 
 # Import and run the main function
-from pfndispatchcopy import main
+from cvv import main
 
 if __name__ == "__main__":
     sys.exit(main())
