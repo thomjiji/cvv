@@ -79,7 +79,7 @@ class CopyConfig:
         source_verify = verify_mode_map.get(args.source_verify, VerificationMode.NONE)
 
         return cls(
-            buffer_size=args.buffer_size,
+            buffer_size=BUFFER_SIZE_8MB,
             source_verification=source_verify,
             source_verification_hash=args.source_verify_hash or "xxh64be",
             verbose=args.verbose,
@@ -1033,10 +1033,10 @@ def parse_arguments() -> argparse.Namespace:
         description="Professional file copying tool with integrity verification",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s -v source.mov dest1.mov dest2.mov
-  %(prog)s -b 16777216 --source-verify per_file \\
-    --source-verify-hash md5 source.mov dest1.mov dest2.mov
+ Examples:
+   %(prog)s -v source.mov dest1.mov dest2.mov
+   %(prog)s --source-verify per_file \\
+     --source-verify-hash md5 source.mov dest1.mov dest2.mov
         """,
     )
 
@@ -1066,14 +1066,8 @@ Examples:
         "Only used when --source-verify is enabled.",
     )
 
-    # Buffer size
-    parser.add_argument(
-        "-b",
-        "--buffer-size",
-        type=int,
-        default=BUFFER_SIZE_8MB,
-        help="Buffer size in bytes (default: 8MB)",
-    )
+    # Buffer size is fixed and determined by BUFFER_SIZE_8MB constant
+    # Removed user-configurable buffer size option
 
     # Source file or directory (required)
     parser.add_argument("source", type=Path, help="Source file or directory path")
