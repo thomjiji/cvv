@@ -410,7 +410,7 @@ class ProgressTracker:
 
             if time_threshold and (bytes_threshold or percentage_threshold):
                 logging.info(
-                    f"copied {bytes_copied:,} of {self.total_size:,} bytes "
+                    f"copied {bytes_copied} of {self.total_size} bytes "
                     f"({current_percentage:.1f}%)"
                 )
                 self.last_update = current_time
