@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 # Buffer size constants
-BUFFER_SIZE_8MB = 8 * 1024 * 1024  # 8MB in bytes
+BUFFER_SIZE = 8 * 1024 * 1024  # 8MB in bytes
 
 try:
     import importlib.util
@@ -53,7 +53,7 @@ class VerificationResult:
 class CopyConfig:
     """Configuration for file copy operations."""
 
-    buffer_size: int = BUFFER_SIZE_8MB
+    buffer_size: int = BUFFER_SIZE
     source_verification: VerificationMode = VerificationMode.NONE
     source_verification_hash: str = "xxh64be"
     verbose: bool = False
@@ -79,7 +79,7 @@ class CopyConfig:
         source_verify = verify_mode_map.get(args.source_verify, VerificationMode.NONE)
 
         return cls(
-            buffer_size=BUFFER_SIZE_8MB,
+            buffer_size=BUFFER_SIZE,
             source_verification=source_verify,
             source_verification_hash=args.source_verify_hash or "xxh64be",
             verbose=args.verbose,
@@ -456,7 +456,7 @@ class HashCalculator:
                 "xxhash library not available. Install with: pip install xxhash"
             )
 
-    def calculate(self, file_path: Path, buffer_size: int = BUFFER_SIZE_8MB) -> str:
+    def calculate(self, file_path: Path, buffer_size: int = BUFFER_SIZE) -> str:
         """
         Calculate hash of file.
 
