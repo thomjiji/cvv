@@ -8,13 +8,9 @@ version = "1.0.0"
 description = "Professional file copying tools for DIT workflows"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
-authors = [
-    {name = "offload-ai project"},
-]
-maintainers = [
-    {name = "offload-ai project"},
-]
+license = { text = "MIT" }
+authors = [{ name = "offload-ai project" }]
+maintainers = [{ name = "offload-ai project" }]
 keywords = [
     "file-copy",
     "backup",
@@ -43,16 +39,12 @@ classifiers = [
     "Topic :: Utilities",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = ["xxhash>=3.0.0"]
 
 [project.optional-dependencies]
-xxhash = ["xxhash>=3.0.0"]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "ruff>=0.1.0",
-]
-all = ["xxhash>=3.0.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "ruff>=0.1.0"]
+
+all = []
 
 [project.urls]
 Homepage = "https://github.com/your-repo/offload-ai"
@@ -64,7 +56,7 @@ Repository = "https://github.com/your-repo/offload-ai.git"
 pfndispatchcopy = "pfndispatchcopy:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -73,18 +65,57 @@ where = ["src"]
 # Enable pycodestyle (`E`) and Pyflakes (`F`) codes by default.
 select = ["E", "F"]
 extend-select = [
-    "I",      # isort
-    "C9",     # mccabe
-    "B",      # flake8-bugbear
-    "Q",      # flake8-quotes
-    "SIM",    # flake8-simplify
-    "UP",     # pyupgrade
+    "I",   # isort
+    "C9",  # mccabe
+    "B",   # flake8-bugbear
+    "Q",   # flake8-quotes
+    "SIM", # flake8-simplify
+    "UP",  # pyupgrade
 ]
 line-length = 88
 target-version = "py313"
 
 # Allow autofix for all enabled rules (when `--fix`) is provided.
-fixable = ["A", "B", "C", "D", "E", "F", "G", "I", "N", "Q", "S", "T", "W", "ANN", "ARG", "BLE", "COM", "DJ", "DTZ", "EM", "ERA", "EXE", "FBT", "ICN", "ISC", "NPY", "PD", "PGH", "PIE", "PL", "PT", "PYI", "RUF", "SLF", "TCH", "TID", "UP", "YTT"]
+fixable = [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "I",
+    "N",
+    "Q",
+    "S",
+    "T",
+    "W",
+    "ANN",
+    "ARG",
+    "BLE",
+    "COM",
+    "DJ",
+    "DTZ",
+    "EM",
+    "ERA",
+    "EXE",
+    "FBT",
+    "ICN",
+    "ISC",
+    "NPY",
+    "PD",
+    "PGH",
+    "PIE",
+    "PL",
+    "PT",
+    "PYI",
+    "RUF",
+    "SLF",
+    "TCH",
+    "TID",
+    "UP",
+    "YTT",
+]
 unfixable = []
 
 # Exclude a variety of commonly ignored directories.
@@ -137,11 +168,7 @@ python_functions = ["test_*"]
 
 [tool.coverage.run]
 source = ["src"]
-omit = [
-    "*/tests/*",
-    "*/test_*.py",
-    "*/__pycache__/*",
-]
+omit = ["*/tests/*", "*/test_*.py", "*/__pycache__/*"]
 
 [tool.coverage.report]
 exclude_lines = [
