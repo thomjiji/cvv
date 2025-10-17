@@ -16,10 +16,9 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
 
 try:
     import xxhash
@@ -31,33 +30,43 @@ except ImportError:
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
 
+
 class CopyJobError(Exception):
     """Custom exception for errors during a copy job."""
+
     pass
+
 
 @dataclass
 class CopyConfig:
     """Configuration for file copy operations."""
+
     buffer_size: int = BUFFER_SIZE
     paranoid_verification: bool = False  # Verify destination hashes after copy
     source_verification_hash: str = "xxh64be"
 
+
 @dataclass
 class FileCopyResult:
     """Result of a single file copy operation."""
+
     source_path: Path
-    destinations: Dict[Path, bool]
-    source_hash: Optional[str] = None
-    destination_hashes: Dict[Path, str] = field(default_factory=dict)
+    destinations: dict[Path, bool]
+    source_hash: str | None = None
+    destination_hashes: dict[Path, str] = field(default_factory=dict)
     size: int = 0
     duration: float = 0.0
     speed_mb_sec: float = 0.0
     verified: bool = True
-    error: Optional[str] = None
+    error: str | None = None
+
 
 class ProgressTracker:
     """Track and report copy progress."""
-    def __init__(self, total_size: int, source_path: Path, callback: Optional[Callable] = None):
+
+    def __init__(
+        self, total_size: int, source_path: Path, callback: Callable | None = None
+    ):
         self.total_size = total_size
         self.source_path = source_path
         self.callback = callback
@@ -76,8 +85,10 @@ class ProgressTracker:
         speed = (self.bytes_copied / (1024 * 1024)) / duration if duration > 0 else 0
         return duration, speed
 
+
 class HashCalculator:
     """Calculate file hashes."""
+
     def __init__(self, algorithm: str = "xxh64be"):
         self.algorithm = algorithm.lower()
         if self.algorithm not in ["xxh64be", "md5", "sha1", "sha256"]:
@@ -96,21 +107,24 @@ class HashCalculator:
         return self.hasher.hexdigest()
 
     @staticmethod
-    def hash_file(file_path: Path, algorithm: str = "xxh64be", buffer_size: int = BUFFER_SIZE) -> str:
+    def hash_file(
+        file_path: Path, algorithm: str = "xxh64be", buffer_size: int = BUFFER_SIZE
+    ) -> str:
         hasher = HashCalculator(algorithm)
         with open(file_path, "rb") as f:
             while chunk := f.read(buffer_size):
                 hasher.update(chunk)
         return hasher.hexdigest()
 
+
 class CopyJob:
     """Manages a single file copy operation from one source to multiple destinations."""
 
-    def __init__(self, config: Optional[CopyConfig] = None):
-        self._source: Optional[Path] = None
-        self._destinations: List[Path] = []
+    def __init__(self, config: CopyConfig | None = None):
+        self._source: Path | None = None
+        self._destinations: list[Path] = []
         self.config = config or CopyConfig()
-        self._progress_callback: Optional[Callable] = None
+        self._progress_callback: Callable | None = None
         self._abort_event = threading.Event()
 
     def source(self, path: Path) -> "CopyJob":
@@ -137,7 +151,9 @@ class CopyJob:
 
         start_time = time.time()
         source_size = self._source.stat().st_size
-        result = FileCopyResult(source_path=self._source, destinations={}, size=source_size)
+        result = FileCopyResult(
+            source_path=self._source, destinations={}, size=source_size
+        )
 
         try:
             self._check_disk_space(source_size)
@@ -153,12 +169,14 @@ class CopyJob:
                 result.verified = verified
                 result.destination_hashes = dest_hashes
                 if not verified:
-                    raise CopyJobError("Paranoid verification failed: Hashes do not match.")
+                    raise CopyJobError(
+                        "Paranoid verification failed: Hashes do not match."
+                    )
 
             result.destinations = {dest: True for dest in self._destinations}
             result.verified = True
 
-        except (CopyJobError, IOError, OSError) as e:
+        except (CopyJobError, OSError) as e:
             logging.error(f"Failed to copy {self._source.name}: {e}")
             result.error = str(e)
             result.verified = False
@@ -168,7 +186,9 @@ class CopyJob:
         finally:
             duration = time.time() - start_time
             result.duration = duration
-            result.speed_mb_sec = (source_size / (1024*1024) / duration) if duration > 0 else 0
+            result.speed_mb_sec = (
+                (source_size / (1024 * 1024) / duration) if duration > 0 else 0
+            )
 
         return result
 
@@ -195,13 +215,17 @@ class CopyJob:
         """Sets up and runs the stream pipeline for copy and hashing."""
         source_hasher = HashCalculator(self.config.source_verification_hash)
         progress = ProgressTracker(source_size, self._source, self._progress_callback)
-        
-        writer_threads: List[threading.Thread] = []
-        chunk_queue = queue.Queue(maxsize=10) # Bounded queue to prevent high memory usage
+
+        writer_threads: list[threading.Thread] = []
+        chunk_queue = queue.Queue(
+            maxsize=10
+        )  # Bounded queue to prevent high memory usage
 
         # Setup and start writer threads
         for dest_path in self._destinations:
-            thread = threading.Thread(target=self._writer_thread, args=(dest_path, chunk_queue))
+            thread = threading.Thread(
+                target=self._writer_thread, args=(dest_path, chunk_queue)
+            )
             thread.start()
             writer_threads.append(thread)
 
@@ -211,11 +235,11 @@ class CopyJob:
                 while True:
                     if self._abort_event.is_set():
                         raise CopyJobError("Operation aborted by user.")
-                    
+
                     chunk = f_src.read(self.config.buffer_size)
                     if not chunk:
                         break
-                    
+
                     source_hasher.update(chunk)
                     chunk_queue.put(chunk)
                     progress.update(len(chunk))
@@ -223,7 +247,7 @@ class CopyJob:
             # Signal writers to finish
             for _ in writer_threads:
                 chunk_queue.put(None)
-            
+
             # Wait for all writers to complete
             for t in writer_threads:
                 t.join()
@@ -242,13 +266,13 @@ class CopyJob:
                     if self._abort_event.is_set():
                         break
                     f_dest.write(chunk)
-            
+
             if not self._abort_event.is_set():
                 shutil.move(temp_path, dest_path)
 
-        except (IOError, OSError) as e:
+        except OSError as e:
             logging.error(f"Error writing to {dest_path}: {e}")
-            self._abort_event.set() # Signal other threads to stop
+            self._abort_event.set()  # Signal other threads to stop
         finally:
             # Cleanup temp file if it still exists
             if temp_path.exists():
@@ -267,42 +291,62 @@ class CopyJob:
                 )
         logging.info("File sizes match.")
 
-    def _verify_destinations(self, source_hash: str) -> tuple[bool, Dict[Path, str]]:
+    def _verify_destinations(self, source_hash: str) -> tuple[bool, dict[Path, str]]:
         """Hashes all destination files and compares to the source hash."""
         logging.info("Paranoid verification enabled. Hashing destination files...")
         all_match = True
-        dest_hashes: Dict[Path, str] = {}
+        dest_hashes: dict[Path, str] = {}
         for dest in self._destinations:
             if self._abort_event.is_set():
                 raise CopyJobError("Verification aborted.")
-            
+
             logging.info(f"Hashing {dest.name}...")
-            dest_hash = HashCalculator.hash_file(dest, self.config.source_verification_hash)
+            dest_hash = HashCalculator.hash_file(
+                dest, self.config.source_verification_hash
+            )
             dest_hashes[dest] = dest_hash
             if dest_hash != source_hash:
                 all_match = False
-                logging.error(f"HASH MISMATCH: {dest.name} hash {dest_hash} != source hash {source_hash}")
-        
+                logging.error(
+                    f"HASH MISMATCH: {dest.name} hash {dest_hash} != source hash {source_hash}"
+                )
+
         if all_match:
             logging.info("All destination hashes match the source hash.")
-        
+
         return all_match, dest_hashes
 
-def discover_files(source: Path) -> List[Path]:
+
+def discover_files(source: Path) -> list[Path]:
     """Discovers all files in a source path, whether it's a file or directory."""
     if source.is_file():
         return [source]
     if source.is_dir():
         return [f for f in source.rglob("*") if f.is_file()]
-    raise FileNotFoundError(f"Source path {source} does not exist or is not a file/directory.")
+    raise FileNotFoundError(
+        f"Source path {source} does not exist or is not a file/directory."
+    )
+
 
 def main():
     """Main function for the cvv command-line tool."""
     parser = argparse.ArgumentParser(description="Professional file copying tool.")
     parser.add_argument("source", type=Path, help="Source file or directory.")
-    parser.add_argument("destinations", type=Path, nargs='+', help="One or more destination files or directories.")
-    parser.add_argument("-p", "--paranoid", action="store_true", help="Verify destination file hashes after copy.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
+    parser.add_argument(
+        "destinations",
+        type=Path,
+        nargs="+",
+        help="One or more destination files or directories.",
+    )
+    parser.add_argument(
+        "-p",
+        "--paranoid",
+        action="store_true",
+        help="Verify destination file hashes after copy.",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose logging."
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -316,11 +360,11 @@ def main():
         logging.info(f"Found {total_files} file(s) to copy.")
 
         config = CopyConfig(paranoid_verification=args.paranoid)
-        
+
         overall_success = True
         for i, file_path in enumerate(source_files):
             logging.info("-" * 60)
-            logging.info(f"Copying file {i+1}/{total_files}: {file_path.name}")
+            logging.info(f"Copying file {i + 1}/{total_files}: {file_path.name}")
 
             # Determine destination paths
             dest_paths = []
@@ -328,7 +372,7 @@ def main():
                 relative_path = file_path.relative_to(args.source)
                 for dest_root in args.destinations:
                     dest_paths.append(dest_root / relative_path)
-            else: # source is a file
+            else:  # source is a file
                 # If one dest is given and it's a dir, place file inside it
                 if len(args.destinations) == 1 and args.destinations[0].is_dir():
                     dest_paths.append(args.destinations[0] / file_path.name)
@@ -342,14 +386,14 @@ def main():
             # Simple progress bar callback
             def progress_callback(copied, total):
                 percent = (copied / total * 100) if total > 0 else 0
-                bar = '█' * int(percent / 2) + '-' * (50 - int(percent / 2))
+                bar = "█" * int(percent / 2) + "-" * (50 - int(percent / 2))
                 sys.stdout.write(f"\rProgress: |{bar}| {percent:.2f}%")
                 sys.stdout.flush()
 
             job.on_progress(progress_callback)
-            
+
             result = job.execute()
-            sys.stdout.write("\n") # Newline after progress bar
+            sys.stdout.write("\n")  # Newline after progress bar
 
             if result.error:
                 logging.error(f"Result for {file_path.name}: FAILED")
@@ -358,7 +402,9 @@ def main():
                 logging.info(f"Result for {file_path.name}: SUCCESS")
                 logging.info(f"  - Size: {result.size / 1e6:.2f} MB")
                 logging.info(f"  - Speed: {result.speed_mb_sec:.2f} MB/s")
-                logging.info(f"  - Source Hash ({config.source_verification_hash}): {result.source_hash}")
+                logging.info(
+                    f"  - Source Hash ({config.source_verification_hash}): {result.source_hash}"
+                )
                 if result.verified:
                     logging.info("  - Verification: PASSED")
 
@@ -376,6 +422,7 @@ def main():
     except KeyboardInterrupt:
         logging.warning("\nOperation interrupted by user.")
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
