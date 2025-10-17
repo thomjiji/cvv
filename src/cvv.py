@@ -8,6 +8,7 @@ and multi-destination support for professional DIT workflows.
 """
 
 import argparse
+import contextlib
 import hashlib
 import logging
 import queue
@@ -544,21 +545,42 @@ class ParallelWriter:
         self.chunks_written = {dest: 0 for dest in destinations}
         self.total_bytes_written = 0
         self.write_lock = threading.Lock()
+        self.exit_stack = contextlib.ExitStack()
 
         # Initialize hash calculator - always use xxh64be for data stream hashing
         self.hasher = xxhash.xxh64()
 
-    def open_files(self) -> None:
-        """Open all destination files for writing."""
+    def __enter__(self) -> "ParallelWriter":
+        """Enter context manager - open all destination files for writing."""
         for dest in self.destinations:
-            # TODO: ruff says use context manager to open files
-            self.file_handles[dest] = open(self.temp_files[dest], "wb")
+            # Use ExitStack to manage multiple file context managers
+            file_handle = self.exit_stack.enter_context(
+                open(self.temp_files[dest], "wb")
+            )
+            self.file_handles[dest] = file_handle
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit context manager - close all destination files."""
+        self.exit_stack.close()
+
+    def open_files(self) -> None:
+        """
+        Open all destination files for writing using context managers.
+
+        Deprecated: Use ParallelWriter as a context manager instead.
+        This method is kept for backward compatibility.
+        """
+        self.__enter__()
 
     def close_files(self) -> None:
-        """Close all destination files."""
-        for handle in self.file_handles.values():
-            if not handle.closed:
-                handle.close()
+        """
+        Close all destination files using the exit stack.
+
+        Deprecated: Use ParallelWriter as a context manager instead.
+        This method is kept for backward compatibility.
+        """
+        self.exit_stack.close()
 
     def writer_thread(self, destination: Path) -> None:
         """
@@ -876,13 +898,10 @@ class CopyTaskWrapper:
                 temp_file = dest.parent / f".{dest.name}.tmp"
                 temp_files[dest] = temp_file
 
-            # Initialize parallel writer
-            parallel_writer = ParallelWriter(
+            # Initialize parallel writer and use it as a context manager
+            with ParallelWriter(
                 destinations, temp_files, progress_tracker, config
-            )
-            parallel_writer.open_files()
-
-            try:
+            ) as parallel_writer:
                 # Start writer threads
                 writer_threads = parallel_writer.start_writers()
 
@@ -906,9 +925,11 @@ class CopyTaskWrapper:
                         logging.error(f"Write error for {dest}: {error}")
                     return results
 
-            finally:
-                parallel_writer.close_files()
+                # Get hash and stats before files are closed
+                file_hash = parallel_writer.get_hash()
+                duration, speed = progress_tracker.get_stats()
 
+            # Files are now closed, safe to verify and move them
             # Verify and move files
             for dest in destinations:
                 temp_file = temp_files[dest]
@@ -921,11 +942,8 @@ class CopyTaskWrapper:
                 logging.info(f"Copy completed successfully: {dest}")
                 results["destinations"][str(dest)] = "success"
 
-            # Finalize progress and get stats
-            file_hash = parallel_writer.get_hash()
+            # Finalize progress and store results
             progress_tracker.finish(file_hash)
-
-            duration, speed = progress_tracker.get_stats()
             results["duration"] = duration
             results["speed_mb_sec"] = speed
             if file_hash:
