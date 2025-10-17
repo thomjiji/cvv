@@ -779,7 +779,6 @@ class CopyTaskWrapper:
                 # Map to destination paths
                 dest_files = self.map_destinations(source_file, source, destinations)
 
-                # Copy file using unified method
                 file_result = self.copy_file(
                     source=source_file,
                     destinations=dest_files,
@@ -1051,9 +1050,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Hash algorithm for source verification (default: xxh64be). "
         "Only used when --source-verify is enabled.",
     )
-
-    # Buffer size is fixed and determined by BUFFER_SIZE_8MB constant
-    # Removed user-configurable buffer size option
 
     # Source file or directory (required)
     parser.add_argument("source", type=Path, help="Source file or directory path")
