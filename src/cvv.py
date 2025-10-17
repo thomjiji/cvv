@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from io import BufferedWriter
 from pathlib import Path
 from typing import Any
 
@@ -376,11 +377,11 @@ class ProgressTracker:
         update_interval : float
             Interval between progress updates in seconds
         """
-        self.total_size = total_size
-        self.source_path = source_path
-        self.update_interval = update_interval
-        self.bytes_copied = 0
-        self.start_time = 0.0
+        self.total_size: int = total_size
+        self.source_path: Path = source_path
+        self.update_interval: float = update_interval
+        self.bytes_copied: int = 0
+        self.start_time: float = 0.0
         self.last_update = 0
         self.last_percentage = 0
         self.min_bytes_threshold = max(
@@ -538,7 +539,7 @@ class ParallelWriter:
         self.progress_tracker = progress_tracker
         self.config = config
         self.chunk_queues = {dest: queue.Queue() for dest in destinations}
-        self.file_handles = {}
+        self.file_handles: dict[Path, BufferedWriter] = {}
         self.write_errors = {}
         self.chunks_written = {dest: 0 for dest in destinations}
         self.total_bytes_written = 0
@@ -550,6 +551,7 @@ class ParallelWriter:
     def open_files(self) -> None:
         """Open all destination files for writing."""
         for dest in self.destinations:
+            # TODO: ruff says use context manager to open files
             self.file_handles[dest] = open(self.temp_files[dest], "wb")
 
     def close_files(self) -> None:
@@ -648,14 +650,16 @@ class CopyTaskWrapper:
 
     def __init__(self, config: CopyConfig) -> None:
         """Initialize PSTaskWrapper."""
-        self.config = config
-        self.verbose = config.verbose
-        self.total_files = 0
-        self.completed_files = 0
-        self.failed_files = 0
-        self.total_bytes = 0
-        self.copied_bytes = 0
-        self.verification_manager = SourceVerificationManager(config)
+        self.config: CopyConfig = config
+        self.verbose: bool = config.verbose
+        self.total_files: int = 0
+        self.completed_files: int = 0
+        self.failed_files: int = 0
+        self.total_bytes: int = 0
+        self.copied_bytes: int = 0
+        self.verification_manager: SourceVerificationManager = (
+            SourceVerificationManager(config)
+        )
 
     def discover_files(self, source_path: Path) -> list[Path]:
         """
@@ -671,9 +675,7 @@ class CopyTaskWrapper:
         list[Path]
             List of all files to be copied
         """
-        if source_path.is_file():
-            return [source_path]
-        elif source_path.is_dir():
+        if source_path.is_dir():
             files = []
             for item in source_path.rglob("*"):
                 if item.is_file():
@@ -744,6 +746,8 @@ class CopyTaskWrapper:
         """Copy directory structure to multiple destinations."""
         logging.info(f"PSTaskWrapper launching directory copy from {source}")
 
+        # check if source verify and log the source verification mode: per_file or
+        # after_all
         if self.verification_manager.should_verify():
             mode = self.config.source_verification.value
             logging.info(f"Source verification enabled: {mode} mode")
@@ -761,6 +765,7 @@ class CopyTaskWrapper:
         # Calculate total size
         self.total_bytes = sum(f.stat().st_size for f in source_files)
 
+        # TODO: This is too shitty...`results`
         results = {
             "success": True,
             "files_copied": 0,
@@ -926,16 +931,20 @@ class CopyTaskWrapper:
             if file_hash:
                 results["hash"] = file_hash
 
+            # TODO: Should I put the source verification here?
             # Source verification if requested
-            if verification_manager and verification_manager.should_verify():
-                verification_manager.prepare_file_for_verification(source)
+            if (
+                verification_manager
+                and verification_manager.should_verify()
+                and verification_manager.should_verify_immediately()
+            ):
+                # verification_manager.prepare_file_for_verification(source)
 
-                if verification_manager.should_verify_immediately():
-                    verify_result = verification_manager.verify_file_immediately(source)
-                    if verify_result:
-                        results["source_verified"] = verify_result.verified
-                        if not verify_result.verified:
-                            results["success"] = False
+                verify_result = verification_manager.verify_file_immediately(source)
+                if verify_result:
+                    results["source_verified"] = verify_result.verified
+                    if not verify_result.verified:
+                        results["success"] = False
 
             return results
 
@@ -962,6 +971,7 @@ class CopyTaskWrapper:
                 destinations=dest_paths,
             )
 
+            # TODO: The verification mode is not clear
             # Perform AFTER_ALL verification for single file if needed
             if self.verification_manager.should_verify_at_end() and result.get(
                 "success"
@@ -977,6 +987,8 @@ class CopyTaskWrapper:
 
             return result
         elif source_path.is_dir():
+            # TODO: PENDING (Unwrap the copy_directory_structure inline here cause
+            # we...)
             # Directory copy
             return self.copy_directory_structure(
                 source=source_path,
