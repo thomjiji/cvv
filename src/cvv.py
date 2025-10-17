@@ -395,14 +395,22 @@ class BatchProcessor:
             self.jobs.append((job, future))
 
     def _get_dest_paths(self, source_file: Path) -> list[Path]:
+        # If the master source was a directory, all destinations are roots.
         if self.args.source.is_dir():
             relative_path = source_file.relative_to(self.args.source)
             return [dest_root / relative_path for dest_root in self.args.destinations]
 
-        if len(self.args.destinations) == 1 and self.args.destinations[0].is_dir():
-            return [self.args.destinations[0] / source_file.name]
-
-        return self.args.destinations
+        # If the master source was a single file.
+        final_dest_paths = []
+        for dest_path in self.args.destinations:
+            if dest_path.is_dir() or (not dest_path.exists() and dest_path.name == ""):
+                # If path is a directory, or looks like one (e.g. `~/tmp/`),
+                # append the source filename.
+                final_dest_paths.append(dest_path / source_file.name)
+            else:
+                # Otherwise, assume the user provided a full destination filepath.
+                final_dest_paths.append(dest_path)
+        return final_dest_paths
 
     def _process_results(self) -> list[FileCopyResult]:
         results = []
