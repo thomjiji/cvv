@@ -211,7 +211,8 @@ class CopyJob:
             usage = shutil.disk_usage(dest.parent)
             if usage.free < source_size:
                 raise CopyJobError(
-                    f"Not enough space on {dest.parent}. Required: {source_size / 1e9:.2f}GB, Available: {usage.free / 1e9:.2f}GB"
+                    f"Not enough space on {dest.parent}. Required: "
+                    f"{source_size / 1e9:.2f}GB, Available: {usage.free / 1e9:.2f}GB"
                 )
 
     def _prepare_destination_dirs(self):
@@ -292,7 +293,9 @@ class CopyJob:
         if post_hash != result.source_hash_inflight:
             result.verified = False
             raise CopyJobError(
-                f"Source file changed during copy. In-flight: {result.source_hash_inflight}, Post-copy: {post_hash}"
+                f"Source file changed during copy. "
+                f"In-flight: {result.source_hash_inflight}, "
+                f"Post-copy: {post_hash}"
             )
 
     def _verify_full_post_copy(self, result: FileCopyResult):
