@@ -168,7 +168,11 @@ class CopyJob:
             else:
                 self._run_pipeline(source_size, enable_hashing=False)
 
-            self._compare_sizes(source_size)
+            # Ensure the progress bar line is terminated before other logs are printed
+            if self._progress_callback:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._compare_sizes(source_size)
             self._perform_post_copy_verification(result)
 
             result.destinations = {dest: True for dest in self._destinations}
@@ -405,7 +409,6 @@ class BatchProcessor:
         for _job, future in self.jobs:
             try:
                 result = future.result()  # Blocks until this job is done
-                sys.stdout.write("\n")
                 if result.error:
                     logging.error(
                         f"Result for {result.source_path.name}: FAILED ({result.error})"
@@ -472,6 +475,7 @@ def main():
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
+        stream=sys.stdout,
     )
 
     try:
