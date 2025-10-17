@@ -262,6 +262,13 @@ class TestArgumentParsing(unittest.TestCase):
 class TestLoggingSetup(unittest.TestCase):
     """Test cases for logging setup."""
 
+    def setUp(self) -> None:
+        """Reset logging configuration."""
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+
+
     def test_setup_logging_info_level(self) -> None:
         """Test logging setup with INFO level."""
         setup_logging(verbose=False)
