@@ -185,4 +185,5 @@ exclude_lines = [
 ]
 
 [tool.basedpyright]
+typeCheckingMode = "basic"
 reportUnusedCallResult = false
