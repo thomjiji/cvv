@@ -217,14 +217,13 @@ class CopyJob:
         progress = ProgressTracker(source_size, self._source, self._progress_callback)
 
         writer_threads: list[threading.Thread] = []
-        chunk_queue = queue.Queue(
-            maxsize=10
-        )  # Bounded queue to prevent high memory usage
+        # Create a separate queue for each writer thread
+        chunk_queues = [queue.Queue(maxsize=10) for _ in self._destinations]
 
         # Setup and start writer threads
-        for dest_path in self._destinations:
+        for i, dest_path in enumerate(self._destinations):
             thread = threading.Thread(
-                target=self._writer_thread, args=(dest_path, chunk_queue)
+                target=self._writer_thread, args=(dest_path, chunk_queues[i])
             )
             thread.start()
             writer_threads.append(thread)
@@ -241,12 +240,14 @@ class CopyJob:
                         break
 
                     source_hasher.update(chunk)
-                    chunk_queue.put(chunk)
+                    # Put the chunk into every writer's queue
+                    for q in chunk_queues:
+                        q.put(chunk)
                     progress.update(len(chunk))
         finally:
-            # Signal writers to finish
-            for _ in writer_threads:
-                chunk_queue.put(None)
+            # Signal all writers to finish
+            for q in chunk_queues:
+                q.put(None)
 
             # Wait for all writers to complete
             for t in writer_threads:
