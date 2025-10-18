@@ -8,6 +8,7 @@ implementation works correctly.
 import hashlib
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -107,8 +108,6 @@ class TestCopyJob(unittest.TestCase):
 
     def tearDown(self) -> None:
         """Clean up the temporary directory."""
-        import shutil
-
         shutil.rmtree(self.test_dir)
 
     def test_successful_copy_transfer_mode(self) -> None:
@@ -143,6 +142,54 @@ class TestCopyJob(unittest.TestCase):
         self.assertEqual(
             result.source_hash_inflight, result.destination_hashes_post[dest1]
         )
+
+    def test_full_verification_catches_corruption(self) -> None:
+        """Test that FULL verification mode catches a corrupted destination file."""
+        dest1 = self.test_path / "dest1.txt"
+        config = CopyConfig(verification_mode=VerificationMode.FULL)
+
+        original_move = shutil.move
+
+        def tampered_move(src, dst):
+            original_move(src, dst)
+            with open(dst, "ab") as f:
+                f.write(b"corruption")
+
+        with patch("shutil.move", side_effect=tampered_move):
+            job = CopyJob(config).source(self.source_file).add_destination(dest1)
+            future = job.execute()
+            result: FileCopyResult = future.result()
+
+            self.assertFalse(result.verified)
+            self.assertIn("Full verification failed", result.error)
+
+    def test_source_verification_catches_source_corruption(self) -> None:
+        """Test that SOURCE verification mode catches a corrupted source file."""
+        dest1 = self.test_path / "dest1.txt"
+        config = CopyConfig(verification_mode=VerificationMode.SOURCE)
+
+        # Keep a reference to the original method
+        original_run_pipeline = CopyJob._run_pipeline
+
+        def tampered_run_pipeline(job_instance, source_size, enable_hashing):
+            # Call the original method to get the in-flight hash
+            hash_inflight = original_run_pipeline(
+                job_instance, source_size, enable_hashing
+            )
+            # Tamper with the source file after it has been read
+            with open(job_instance._source, "ab") as f:
+                f.write(b"source corruption")
+            return hash_inflight
+
+        with patch.object(
+            CopyJob, "_run_pipeline", side_effect=tampered_run_pipeline, autospec=True
+        ):
+            job = CopyJob(config).source(self.source_file).add_destination(dest1)
+            future = job.execute()
+            result: FileCopyResult = future.result()
+
+            self.assertFalse(result.verified)
+            self.assertIn("Source file changed during copy", result.error)
 
     def test_not_enough_disk_space(self) -> None:
         """Test error handling when there is not enough disk space."""
@@ -191,8 +238,6 @@ class TestBatchProcessor(unittest.TestCase):
 
     def tearDown(self) -> None:
         """Clean up the temporary directory."""
-        import shutil
-
         shutil.rmtree(self.test_dir)
 
     def test_run_batch_processor(self) -> None:
