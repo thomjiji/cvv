@@ -431,7 +431,7 @@ class BatchProcessor:
                 else:
                     logging.info(f"Result for {result.source_path.name}: SUCCESS")
                     logging.info(
-                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / 1e6:.2f} MB"
+                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / (1024*1024):.2f} MB ({result.size} bytes)"
                     )
                     if result.source_hash_inflight:
                         logging.info(
