@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -136,7 +136,6 @@ class CopyJob:
         self.config = config or CopyConfig()
         self._progress_callback: Callable | None = None
         self._abort_event = threading.Event()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="CopyJob")
 
     def source(self, path: Path) -> "CopyJob":
         """Set the source file for the copy job."""
@@ -157,14 +156,14 @@ class CopyJob:
         """Signal the copy job to abort."""
         self._abort_event.set()
 
-    def execute(self) -> Future[FileCopyResult]:
-        """Executes the copy job asynchronously and returns a Future."""
+    def execute(self) -> FileCopyResult:
+        """Executes the copy job synchronously and returns the result."""
         if not self._source or not self._destinations:
             raise CopyJobError("Source and at least one destination must be set.")
-        return self._executor.submit(self._run_and_get_result)
+        return self._run_and_get_result()
 
     def _run_and_get_result(self) -> FileCopyResult:
-        """The actual workhorse method that runs in a background thread."""
+        """The actual workhorse method that performs the copy operation."""
         start_time = time.time()
         source_size = self._source.stat().st_size
         result = FileCopyResult(source_path=self._source, size=source_size)
@@ -201,7 +200,6 @@ class CopyJob:
             result.speed_mb_sec = (
                 (source_size / (1024 * 1024) / duration) if duration > 0 else 0
             )
-            self._executor.shutdown(wait=False)
 
         return result
 
@@ -400,7 +398,9 @@ class BatchProcessor:
             return sorted([f for f in source.rglob("*") if f.is_file()])
         raise FileNotFoundError(f"Source path {source} does not exist.")
 
-    def _execute_jobs_sequentially(self, source_files: list[Path]) -> list[FileCopyResult]:
+    def _execute_jobs_sequentially(
+        self, source_files: list[Path]
+    ) -> list[FileCopyResult]:
         """Create, execute, and wait for each CopyJob sequentially."""
         results = []
         total_files = len(source_files)
@@ -420,10 +420,9 @@ class BatchProcessor:
                 sys.stdout.flush()
 
             job.on_progress(progress_callback)
-            future = job.execute()
 
             try:
-                result = future.result()  # This blocks until the current job is done
+                result = job.execute()  # This blocks until the current job is done
                 if result.error:
                     logging.error(
                         f"Result for {result.source_path.name}: FAILED ({result.error})"
@@ -431,7 +430,7 @@ class BatchProcessor:
                 else:
                     logging.info(f"Result for {result.source_path.name}: SUCCESS")
                     logging.info(
-                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / (1024*1024):.2f} MB ({result.size} bytes)"
+                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / (1024 * 1024):.2f} MB ({result.size} bytes)"
                     )
                     if result.source_hash_inflight:
                         logging.info(
@@ -439,8 +438,12 @@ class BatchProcessor:
                         )
                 results.append(result)
             except Exception as e:
-                logging.error(f"A job for {file_path.name} failed with an unexpected exception: {e}")
-                results.append(FileCopyResult(source_path=file_path, verified=False, error=str(e)))
+                logging.error(
+                    f"A job for {file_path.name} failed with an unexpected exception: {e}"
+                )
+                results.append(
+                    FileCopyResult(source_path=file_path, verified=False, error=str(e))
+                )
         return results
 
     def _get_dest_paths(self, source_file: Path) -> list[Path]:
