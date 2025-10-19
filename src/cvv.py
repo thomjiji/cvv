@@ -77,13 +77,15 @@ class FileCopyResult:
 class ProgressTracker:
     """Track and report copy progress."""
 
-    def __init__(self, total_size: int, callback: Callable | None = None):
+    def __init__(self, total_size: int, callback: Callable | None = None) -> None:
+        """Initialize the progress tracker."""
         self.total_size = total_size
         self.callback = callback
         self.bytes_copied = 0
         self.lock = threading.Lock()
 
-    def update(self, chunk_size: int):
+    def update(self, chunk_size: int) -> None:
+        """Update the progress with a new chunk size."""
         with self.lock:
             self.bytes_copied += chunk_size
             if self.callback:
@@ -93,25 +95,30 @@ class ProgressTracker:
 class HashCalculator:
     """Calculate file hashes."""
 
-    def __init__(self, algorithm: str = "xxh64be"):
+    def __init__(self, algorithm: str = "xxh64be") -> None:
+        """Initialize the hash calculator with a given algorithm."""
         self.algorithm = algorithm.lower()
         if self.algorithm not in ["xxh64be", "md5", "sha1", "sha256"]:
             raise ValueError(f"Unsupported hash algorithm: {self.algorithm}")
         self.hasher = self._get_hasher()
 
-    def _get_hasher(self):
+    def _get_hasher(self) -> "xxhash.xxh64 | hashlib._Hash":
+        """Return a new hasher instance based on the algorithm."""
         if self.algorithm == "xxh64be":
             return xxhash.xxh64()
         return hashlib.new(self.algorithm)
 
-    def update(self, data: bytes):
+    def update(self, data: bytes) -> None:
+        """Update the hasher with a chunk of data."""
         self.hasher.update(data)
 
     def hexdigest(self) -> str:
+        """Return the hex digest of the hash."""
         return self.hasher.hexdigest()
 
     @staticmethod
     def hash_file(file_path: Path, algorithm: str, buffer_size: int) -> str:
+        """Calculate and return the hash of a file."""
         hasher = HashCalculator(algorithm)
         with open(file_path, "rb") as f:
             while chunk := f.read(buffer_size):
@@ -122,7 +129,8 @@ class HashCalculator:
 class CopyJob:
     """Manages a single file copy operation from one source to multiple destinations."""
 
-    def __init__(self, config: CopyConfig | None = None):
+    def __init__(self, config: CopyConfig | None = None) -> None:
+        """Initialize the copy job."""
         self._source: Path | None = None
         self._destinations: list[Path] = []
         self.config = config or CopyConfig()
@@ -131,18 +139,22 @@ class CopyJob:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="CopyJob")
 
     def source(self, path: Path) -> "CopyJob":
+        """Set the source file for the copy job."""
         self._source = path
         return self
 
     def add_destination(self, path: Path) -> "CopyJob":
+        """Add a destination path for the copy job."""
         self._destinations.append(path)
         return self
 
     def on_progress(self, callback: Callable) -> "CopyJob":
+        """Register a callback function for progress updates."""
         self._progress_callback = callback
         return self
 
-    def abort(self):
+    def abort(self) -> None:
+        """Signal the copy job to abort."""
         self._abort_event.set()
 
     def execute(self) -> Future[FileCopyResult]:
@@ -193,7 +205,8 @@ class CopyJob:
 
         return result
 
-    def _perform_post_copy_verification(self, result: FileCopyResult):
+    def _perform_post_copy_verification(self, result: FileCopyResult) -> None:
+        """Perform verification based on the configured mode."""
         mode = self.config.verification_mode
         logging.info(f"Starting '{mode.value}' verification...")
 
@@ -209,7 +222,8 @@ class CopyJob:
             self._verify_full_post_copy(result)
             logging.info("Source and all destinations verified successfully.")
 
-    def _check_disk_space(self, source_size: int):
+    def _check_disk_space(self, source_size: int) -> None:
+        """Check if there is enough disk space on all destinations."""
         for dest in self._destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
             usage = shutil.disk_usage(dest.parent)
@@ -219,7 +233,8 @@ class CopyJob:
                     f"{source_size / 1e9:.2f}GB, Available: {usage.free / 1e9:.2f}GB"
                 )
 
-    def _prepare_destination_dirs(self):
+    def _prepare_destination_dirs(self) -> None:
+        """Ensure all destination parent directories exist."""
         for dest in self._destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -262,7 +277,8 @@ class CopyJob:
 
         return source_hasher.hexdigest() if source_hasher else None
 
-    def _writer_thread(self, dest_path: Path, chunk_queue: queue.Queue):
+    def _writer_thread(self, dest_path: Path, chunk_queue: queue.Queue) -> None:
+        """Target method for writer threads to write chunks to a temporary file."""
         temp_path = dest_path.with_suffix(f"{dest_path.suffix}.tmp")
         try:
             with open(temp_path, "wb") as f_dest:
@@ -283,7 +299,8 @@ class CopyJob:
                 with contextlib.suppress(OSError):
                     temp_path.unlink()
 
-    def _compare_sizes(self, source_size: int):
+    def _compare_sizes(self, source_size: int) -> None:
+        """Compare the source file size with all destination file sizes."""
         for dest in self._destinations:
             dest_size = dest.stat().st_size
             if source_size != dest_size:
@@ -291,7 +308,8 @@ class CopyJob:
                     f"File size mismatch for {dest.name}. Source: {source_size}, Dest: {dest_size}"
                 )
 
-    def _verify_source_post_copy(self, result: FileCopyResult):
+    def _verify_source_post_copy(self, result: FileCopyResult) -> None:
+        """Verify the source file integrity by re-hashing it after the copy."""
         logging.info(f"Re-hashing source file {self._source.name}...")
         post_hash = HashCalculator.hash_file(
             self._source, self.config.hash_algorithm, self.config.buffer_size
@@ -305,7 +323,8 @@ class CopyJob:
                 f"Post-copy: {post_hash}"
             )
 
-    def _verify_full_post_copy(self, result: FileCopyResult):
+    def _verify_full_post_copy(self, result: FileCopyResult) -> None:
+        """Verify integrity of the source and all destination files by re-hashing them."""
         logging.info("Re-hashing source and all destinations in parallel...")
         files_to_hash = [self._source] + self._destinations
         hashes = {}
@@ -351,24 +370,31 @@ class CopyJob:
 class BatchProcessor:
     """Manages a batch of copy jobs from a single command-line invocation."""
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace) -> None:
+        """Initialize the batch processor with command-line arguments."""
         self.args = args
         self.config = self._create_config()
         self.jobs: list[tuple[CopyJob, Future[FileCopyResult]]] = []
 
     def _create_config(self) -> CopyConfig:
+        """Create a CopyConfig object from command-line arguments."""
         return CopyConfig(
             verification_mode=VerificationMode(self.args.mode),
             hash_algorithm=self.args.hash_algorithm,
         )
 
     def run(self) -> bool:
+        """Run the entire batch of copy jobs and return the overall success."""
         source_files = self._discover_files()
         self._execute_jobs(source_files)
         results = self._process_results()
         return self._final_summary(results)
 
     def _discover_files(self) -> list[Path]:
+        """
+        Discover all source files to be copied, handling both files and
+        directories.
+        """
         source = self.args.source
         if source.is_file():
             return [source]
@@ -376,7 +402,8 @@ class BatchProcessor:
             return sorted([f for f in source.rglob("*") if f.is_file()])
         raise FileNotFoundError(f"Source path {source} does not exist.")
 
-    def _execute_jobs(self, source_files: list[Path]):
+    def _execute_jobs(self, source_files: list[Path]) -> None:
+        """Create and execute a CopyJob for each source file."""
         total_files = len(source_files)
         for i, file_path in enumerate(source_files):
             logging.info("-" * 60)
@@ -398,6 +425,7 @@ class BatchProcessor:
             self.jobs.append((job, future))
 
     def _get_dest_paths(self, source_file: Path) -> list[Path]:
+        """Calculate the full destination paths for a given source file."""
         # If the master source was a directory, all destinations are roots.
         if self.args.source.is_dir():
             relative_path = source_file.relative_to(self.args.source)
@@ -416,6 +444,7 @@ class BatchProcessor:
         return final_dest_paths
 
     def _process_results(self) -> list[FileCopyResult]:
+        """Wait for all jobs to complete and collect their results."""
         results = []
         for _job, future in self.jobs:
             try:
@@ -439,6 +468,7 @@ class BatchProcessor:
         return results
 
     def _final_summary(self, results: list[FileCopyResult]) -> bool:
+        """Log a final summary of all operations and return overall success."""
         logging.info("=" * 60)
         success_count = sum(1 for r in results if not r.error and r.verified)
         total_count = len(results)
@@ -453,7 +483,7 @@ class BatchProcessor:
             return False
 
 
-def main():
+def main() -> int:
     """Main function for the cvv command-line tool."""
     parser = argparse.ArgumentParser(description="Professional file copying tool.")
     parser.add_argument("source", type=Path, help="Source file or directory.")
