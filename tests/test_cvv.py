@@ -168,12 +168,11 @@ class TestCopyJob(unittest.TestCase):
         dest1 = self.test_path / "dest1.txt"
         config = CopyConfig(verification_mode=VerificationMode.SOURCE)
 
-        # Keep a reference to the original method
-        original_run_pipeline = CopyJob._run_pipeline
+        original_stream_and_dispatch = CopyJob._stream_and_dispatch_chunks
 
-        def tampered_run_pipeline(job_instance, source_size, enable_hashing):
+        def tampered_stream_and_dispatch(job_instance, source_size, enable_hashing):
             # Call the original method to get the in-flight hash
-            hash_inflight = original_run_pipeline(
+            hash_inflight = original_stream_and_dispatch(
                 job_instance, source_size, enable_hashing
             )
             # Tamper with the source file after it has been read
@@ -182,7 +181,10 @@ class TestCopyJob(unittest.TestCase):
             return hash_inflight
 
         with patch.object(
-            CopyJob, "_run_pipeline", side_effect=tampered_run_pipeline, autospec=True
+            CopyJob,
+            "_stream_and_dispatch_chunks",
+            side_effect=tampered_stream_and_dispatch,
+            autospec=True,
         ):
             job = CopyJob(config).source(self.source_file).add_destination(dest1)
             future = job.execute()

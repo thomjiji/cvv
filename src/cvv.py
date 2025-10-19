@@ -162,11 +162,11 @@ class CopyJob:
             self._prepare_destination_dirs()
 
             if self.config.verification_mode != VerificationMode.TRANSFER:
-                result.source_hash_inflight = self._run_pipeline(
+                result.source_hash_inflight = self._stream_and_dispatch_chunks(
                     source_size, enable_hashing=True
                 )
             else:
-                self._run_pipeline(source_size, enable_hashing=False)
+                self._stream_and_dispatch_chunks(source_size, enable_hashing=False)
 
             # Ensure the progress bar line is terminated before other logs are printed
             if self._progress_callback:
@@ -223,7 +223,10 @@ class CopyJob:
         for dest in self._destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-    def _run_pipeline(self, source_size: int, enable_hashing: bool) -> str | None:
+    def _stream_and_dispatch_chunks(
+        self, source_size: int, enable_hashing: bool
+    ) -> str | None:
+        """Read the source file and dispatch chunks to writer threads."""
         source_hasher = (
             HashCalculator(self.config.hash_algorithm) if enable_hashing else None
         )
