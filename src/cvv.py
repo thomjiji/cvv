@@ -374,7 +374,6 @@ class BatchProcessor:
         """Initialize the batch processor with command-line arguments."""
         self.args = args
         self.config = self._create_config()
-        self.jobs: list[tuple[CopyJob, Future[FileCopyResult]]] = []
 
     def _create_config(self) -> CopyConfig:
         """Create a CopyConfig object from command-line arguments."""
@@ -384,10 +383,9 @@ class BatchProcessor:
         )
 
     def run(self) -> bool:
-        """Run the entire batch of copy jobs and return the overall success."""
+        """Run the entire batch of copy jobs sequentially and return the overall success."""
         source_files = self._discover_files()
-        self._execute_jobs(source_files)
-        results = self._process_results()
+        results = self._execute_jobs_sequentially(source_files)
         return self._final_summary(results)
 
     def _discover_files(self) -> list[Path]:
@@ -402,8 +400,9 @@ class BatchProcessor:
             return sorted([f for f in source.rglob("*") if f.is_file()])
         raise FileNotFoundError(f"Source path {source} does not exist.")
 
-    def _execute_jobs(self, source_files: list[Path]) -> None:
-        """Create and execute a CopyJob for each source file."""
+    def _execute_jobs_sequentially(self, source_files: list[Path]) -> list[FileCopyResult]:
+        """Create, execute, and wait for each CopyJob sequentially."""
+        results = []
         total_files = len(source_files)
         for i, file_path in enumerate(source_files):
             logging.info("-" * 60)
@@ -422,7 +421,27 @@ class BatchProcessor:
 
             job.on_progress(progress_callback)
             future = job.execute()
-            self.jobs.append((job, future))
+
+            try:
+                result = future.result()  # This blocks until the current job is done
+                if result.error:
+                    logging.error(
+                        f"Result for {result.source_path.name}: FAILED ({result.error})"
+                    )
+                else:
+                    logging.info(f"Result for {result.source_path.name}: SUCCESS")
+                    logging.info(
+                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / 1e6:.2f} MB"
+                    )
+                    if result.source_hash_inflight:
+                        logging.info(
+                            f"  - Hash ({self.config.hash_algorithm}): {result.source_hash_inflight}"
+                        )
+                results.append(result)
+            except Exception as e:
+                logging.error(f"A job for {file_path.name} failed with an unexpected exception: {e}")
+                results.append(FileCopyResult(source_path=file_path, verified=False, error=str(e)))
+        return results
 
     def _get_dest_paths(self, source_file: Path) -> list[Path]:
         """Calculate the full destination paths for a given source file."""
@@ -442,30 +461,6 @@ class BatchProcessor:
                 # Otherwise, assume the user provided a full destination filepath.
                 final_dest_paths.append(dest_path)
         return final_dest_paths
-
-    def _process_results(self) -> list[FileCopyResult]:
-        """Wait for all jobs to complete and collect their results."""
-        results = []
-        for _job, future in self.jobs:
-            try:
-                result = future.result()  # Blocks until this job is done
-                if result.error:
-                    logging.error(
-                        f"Result for {result.source_path.name}: FAILED ({result.error})"
-                    )
-                else:
-                    logging.info(f"Result for {result.source_path.name}: SUCCESS")
-                    logging.info(
-                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / 1e6:.2f} MB"
-                    )
-                    if result.source_hash_inflight:
-                        logging.info(
-                            f"  - Hash ({self.config.hash_algorithm}): {result.source_hash_inflight}"
-                        )
-                results.append(result)
-            except Exception as e:
-                logging.error(f"A job failed with an unexpected exception: {e}")
-        return results
 
     def _final_summary(self, results: list[FileCopyResult]) -> bool:
         """Log a final summary of all operations and return overall success."""
