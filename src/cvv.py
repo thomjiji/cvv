@@ -131,7 +131,7 @@ class CopyJob:
 
     def __init__(self, config: CopyConfig | None = None) -> None:
         """Initialize the copy job."""
-        self._source: Path | None = None
+        self._source: Path
         self._destinations: list[Path] = []
         self.config = config or CopyConfig()
         self._progress_callback: Callable | None = None
