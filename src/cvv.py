@@ -27,7 +27,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 try:
     import xxhash
@@ -38,16 +37,16 @@ except ImportError:
 
 try:
     from rich.console import Console
+    from rich.panel import Panel
     from rich.progress import (
+        BarColumn,
+        DownloadColumn,
         Progress,
         SpinnerColumn,
-        BarColumn,
         TextColumn,
         TimeRemainingColumn,
         TransferSpeedColumn,
-        DownloadColumn,
     )
-    from rich.panel import Panel
     from rich.table import Table
 except ImportError:
     print("ERROR: The 'rich' library is required but not installed.", file=sys.stderr)
@@ -100,8 +99,8 @@ class DestinationResult:
     path: Path
     success: bool
     bytes_written: int = 0
-    hash_post: Optional[str] = None
-    error: Optional[str] = None
+    hash_post: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -111,8 +110,8 @@ class CopyResult:
     source_path: Path
     source_size: int
     destinations: list[DestinationResult] = field(default_factory=list)
-    source_hash_inflight: Optional[str] = None
-    source_hash_post: Optional[str] = None
+    source_hash_inflight: str | None = None
+    source_hash_post: str | None = None
     duration: float = 0.0
     verification_mode: VerificationMode = VerificationMode.TRANSFER
 
@@ -739,7 +738,11 @@ class CLIProcessor:
                         f"  Source hash (in-flight):  {result.source_hash_inflight}"
                     )
                 if result.source_hash_post:
-                    match_indicator = "✓" if result.source_hash_post == result.source_hash_inflight else "✗"
+                    match_indicator = (
+                        "✓"
+                        if result.source_hash_post == result.source_hash_inflight
+                        else "✗"
+                    )
                     self.console.print(
                         f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
                     )
@@ -751,7 +754,11 @@ class CLIProcessor:
                         f"  Source hash (in-flight):  {result.source_hash_inflight}"
                     )
                 if result.source_hash_post:
-                    match_indicator = "✓" if result.source_hash_post == result.source_hash_inflight else "✗"
+                    match_indicator = (
+                        "✓"
+                        if result.source_hash_post == result.source_hash_inflight
+                        else "✗"
+                    )
                     self.console.print(
                         f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
                     )
@@ -759,7 +766,11 @@ class CLIProcessor:
                 # Show each destination hash
                 for dest_result in result.destinations:
                     if dest_result.hash_post:
-                        match_indicator = "✓" if dest_result.hash_post == result.source_hash_inflight else "✗"
+                        match_indicator = (
+                            "✓"
+                            if dest_result.hash_post == result.source_hash_inflight
+                            else "✗"
+                        )
                         self.console.print(
                             f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
                         )
