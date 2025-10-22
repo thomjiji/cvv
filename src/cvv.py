@@ -2,13 +2,18 @@
 """
 cvv - Professional file copying tool with integrity verification.
 
-This tool is designed to provide reliable file copying with hash verification,
-progress monitoring, and multi-destination support, emulating best practices
-from professional DIT (Digital Imaging Technician) software.
+A clean, professional implementation of multi-destination file copying with
+configurable verification modes, designed for DIT (Digital Imaging Technician)
+workflows.
+
+Architecture:
+- Core logic is completely UI-agnostic (yields events, never touches stdout)
+- Generator pattern for natural progress reporting
+- Per-destination error tracking
+- Clean separation between business logic and presentation
 """
 
 import argparse
-import contextlib
 import hashlib
 import logging
 import queue
@@ -16,517 +21,819 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 try:
     import xxhash
 except ImportError:
-    logging.error("The 'xxhash' library is required but not installed.")
-    logging.error("Please install it using: pip install xxhash")
+    print("ERROR: The 'xxhash' library is required but not installed.", file=sys.stderr)
+    print("Please install it using: pip install xxhash", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    from rich.console import Console
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+        DownloadColumn,
+    )
+    from rich.panel import Panel
+    from rich.table import Table
+except ImportError:
+    print("ERROR: The 'rich' library is required but not installed.", file=sys.stderr)
+    print("Please install it using: pip install rich", file=sys.stderr)
     sys.exit(1)
 
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
+QUEUE_SIZE = 10  # Max chunks buffered per destination
+
+
+# ============================================================================
+# Data Models
+# ============================================================================
 
 
 class VerificationMode(Enum):
-    """Defines the verification strategy for the copy operation."""
+    """Verification strategy for copy operations."""
 
-    # fmt: off
-    TRANSFER = "transfer"  # Verify by file size only.
-    SOURCE = "source"      # Verify source read integrity and destination file sizes.
-    FULL = "full"          # Verify source and all destinations with checksums.
-    # fmt: on
+    TRANSFER = "transfer"  # File size comparison only
+    SOURCE = "source"  # Hash source in-flight and post-copy
+    FULL = "full"  # Hash source and all destinations post-copy
 
 
-class CopyJobError(Exception):
-    """Custom exception for errors during a copy job."""
+class EventType(Enum):
+    """Events emitted during copy operations."""
 
-    pass
-
-
-@dataclass
-class CopyConfig:
-    """Configuration for file copy operations."""
-
-    buffer_size: int = BUFFER_SIZE
-    verification_mode: VerificationMode = VerificationMode.FULL
-    hash_algorithm: str = "xxh64be"
+    COPY_START = "copy_start"
+    COPY_PROGRESS = "copy_progress"
+    COPY_COMPLETE = "copy_complete"
+    VERIFY_START = "verify_start"
+    VERIFY_PROGRESS = "verify_progress"
+    VERIFY_COMPLETE = "verify_complete"
 
 
 @dataclass
-class FileCopyResult:
-    """Result of a single file copy operation."""
+class CopyEvent:
+    """Event emitted during copy/verification operations."""
+
+    type: EventType
+    bytes_processed: int = 0
+    total_bytes: int = 0
+    message: str = ""
+
+
+@dataclass
+class DestinationResult:
+    """Result for a single destination."""
+
+    path: Path
+    success: bool
+    bytes_written: int = 0
+    hash_post: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class CopyResult:
+    """Complete result of a multi-destination copy operation."""
 
     source_path: Path
-    destinations: dict[Path, bool] = field(default_factory=dict)
-    source_hash_inflight: str | None = None
-    source_hash_post: str | None = None
-    destination_hashes_post: dict[Path, str] = field(default_factory=dict)
-    size: int = 0
+    source_size: int
+    destinations: list[DestinationResult] = field(default_factory=list)
+    source_hash_inflight: Optional[str] = None
+    source_hash_post: Optional[str] = None
     duration: float = 0.0
-    speed_mb_sec: float = 0.0
-    verified: bool = True
-    error: str | None = None
+    verification_mode: VerificationMode = VerificationMode.TRANSFER
+
+    @property
+    def success(self) -> bool:
+        """Overall success if all destinations succeeded."""
+        return all(d.success for d in self.destinations)
+
+    @property
+    def speed_mb_sec(self) -> float:
+        """Calculate transfer speed in MB/s."""
+        if self.duration > 0:
+            return (self.source_size / (1024 * 1024)) / self.duration
+        return 0.0
 
 
-class ProgressTracker:
-    """Track and report copy progress."""
-
-    def __init__(self, total_size: int, callback: Callable | None = None) -> None:
-        """Initialize the progress tracker."""
-        self.total_size = total_size
-        self.callback = callback
-        self.bytes_copied = 0
-        self.lock = threading.Lock()
-
-    def update(self, chunk_size: int) -> None:
-        """Update the progress with a new chunk size."""
-        with self.lock:
-            self.bytes_copied += chunk_size
-            if self.callback:
-                self.callback(self.bytes_copied, self.total_size)
+# ============================================================================
+# Core Copy Engine (UI-agnostic)
+# ============================================================================
 
 
 class HashCalculator:
-    """Calculate file hashes."""
+    """Thread-safe hash calculator supporting multiple algorithms."""
 
-    def __init__(self, algorithm: str = "xxh64be") -> None:
-        """Initialize the hash calculator with a given algorithm."""
+    def __init__(self, algorithm: str = "xxh64be"):
         self.algorithm = algorithm.lower()
-        if self.algorithm not in ["xxh64be", "md5", "sha1", "sha256"]:
-            raise ValueError(f"Unsupported hash algorithm: {self.algorithm}")
-        self.hasher = self._get_hasher()
-
-    def _get_hasher(self) -> "xxhash.xxh64 | hashlib._Hash":
-        """Return a new hasher instance based on the algorithm."""
         if self.algorithm == "xxh64be":
-            return xxhash.xxh64()
-        return hashlib.new(self.algorithm)
+            self._hasher = xxhash.xxh64()
+        elif self.algorithm in ["md5", "sha1", "sha256"]:
+            self._hasher = hashlib.new(self.algorithm)
+        else:
+            raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
     def update(self, data: bytes) -> None:
-        """Update the hasher with a chunk of data."""
-        self.hasher.update(data)
+        """Update hash with new data."""
+        self._hasher.update(data)
 
     def hexdigest(self) -> str:
-        """Return the hex digest of the hash."""
-        return self.hasher.hexdigest()
+        """Get final hex digest."""
+        return self._hasher.hexdigest()
 
     @staticmethod
-    def hash_file(file_path: Path, algorithm: str, buffer_size: int) -> str:
-        """Calculate and return the hash of a file."""
+    def hash_file(path: Path, algorithm: str = "xxh64be") -> Iterator[tuple[int, str]]:
+        """
+        Hash a file and yield progress.
+
+        Yields: (bytes_hashed, final_hash_or_empty_string)
+        Final yield contains the complete hash.
+        """
         hasher = HashCalculator(algorithm)
-        with open(file_path, "rb") as f:
-            while chunk := f.read(buffer_size):
+        total_bytes = 0
+
+        with open(path, "rb") as f:
+            while chunk := f.read(BUFFER_SIZE):
                 hasher.update(chunk)
-        return hasher.hexdigest()
+                total_bytes += len(chunk)
+                yield (total_bytes, "")
+
+        # Final yield with complete hash
+        yield (total_bytes, hasher.hexdigest())
 
 
-class CopyJob:
-    """Manages a single file copy operation from one source to multiple destinations."""
+class CopyEngine:
+    """
+    Core copy engine: reads source once, writes to multiple destinations.
 
-    def __init__(self, config: CopyConfig | None = None) -> None:
-        """Initialize the copy job."""
-        self._source: Path
-        self._destinations: list[Path] = []
-        self.config = config or CopyConfig()
-        self._progress_callback: Callable | None = None
+    This is completely UI-agnostic - it yields events and never touches stdout.
+    """
+
+    def __init__(
+        self,
+        source: Path,
+        destinations: list[Path],
+        verification_mode: VerificationMode = VerificationMode.FULL,
+        hash_algorithm: str = "xxh64be",
+    ):
+        self.source = source
+        self.destinations = destinations
+        self.verification_mode = verification_mode
+        self.hash_algorithm = hash_algorithm
         self._abort_event = threading.Event()
 
-    def source(self, path: Path) -> "CopyJob":
-        """Set the source file for the copy job."""
-        self._source = path
-        return self
+    def copy(self) -> Iterator[CopyEvent | CopyResult]:
+        """
+        Execute the copy operation.
 
-    def add_destination(self, path: Path) -> "CopyJob":
-        """Add a destination path for the copy job."""
-        self._destinations.append(path)
-        return self
-
-    def on_progress(self, callback: Callable) -> "CopyJob":
-        """Register a callback function for progress updates."""
-        self._progress_callback = callback
-        return self
-
-    def abort(self) -> None:
-        """Signal the copy job to abort."""
-        self._abort_event.set()
-
-    def execute(self) -> FileCopyResult:
-        """Executes the copy job synchronously and returns the result."""
-        if not self._source or not self._destinations:
-            raise CopyJobError("Source and at least one destination must be set.")
-        return self._run_and_get_result()
-
-    def _run_and_get_result(self) -> FileCopyResult:
-        """The actual workhorse method that performs the copy operation."""
+        Yields CopyEvent objects during operation, final yield is CopyResult.
+        """
         start_time = time.time()
-        source_size = self._source.stat().st_size
-        result = FileCopyResult(source_path=self._source, size=source_size)
+        source_size = self.source.stat().st_size
+
+        # Initialize result
+        result = CopyResult(
+            source_path=self.source,
+            source_size=source_size,
+            verification_mode=self.verification_mode,
+        )
 
         try:
+            # Pre-flight checks
+            self._check_source_exists()
             self._check_disk_space(source_size)
-            self._prepare_destination_dirs()
+            self._prepare_destinations()
 
-            if self.config.verification_mode != VerificationMode.TRANSFER:
-                result.source_hash_inflight = self._stream_and_dispatch_chunks(
-                    source_size, enable_hashing=True
-                )
-            else:
-                self._stream_and_dispatch_chunks(source_size, enable_hashing=False)
-
-            # Ensure the progress bar line is terminated before other logs are printed
-            if self._progress_callback:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                self._compare_sizes(source_size)
-            self._perform_post_copy_verification(result)
-
-            result.destinations = {dest: True for dest in self._destinations}
-
-        except (CopyJobError, OSError) as e:
-            logging.error(f"Failed to copy {self._source.name}: {e}")
-            result.error = str(e)
-            result.verified = False
-            for dest in self._destinations:
-                result.destinations[dest] = False
-        finally:
-            duration = time.time() - start_time
-            result.duration = duration
-            result.speed_mb_sec = (
-                (source_size / (1024 * 1024) / duration) if duration > 0 else 0
+            # Copy phase
+            yield CopyEvent(
+                type=EventType.COPY_START,
+                total_bytes=source_size,
+                message=f"Copying {self.source.name} to {len(self.destinations)} destination(s)",
             )
 
-        return result
+            bytes_copied = 0
+            enable_hashing = self.verification_mode != VerificationMode.TRANSFER
 
-    def _perform_post_copy_verification(self, result: FileCopyResult) -> None:
-        """Perform verification based on the configured mode."""
-        mode = self.config.verification_mode
-        logging.info(f"Starting '{mode.value}' verification...")
+            for event_or_hash in self._stream_to_destinations(
+                source_size, enable_hashing
+            ):
+                if isinstance(event_or_hash, str):
+                    # Final hash result
+                    result.source_hash_inflight = event_or_hash
+                else:
+                    # Progress event
+                    bytes_copied = event_or_hash
+                    yield CopyEvent(
+                        type=EventType.COPY_PROGRESS,
+                        bytes_processed=bytes_copied,
+                        total_bytes=source_size,
+                    )
 
-        if mode == VerificationMode.TRANSFER:
-            logging.info("File sizes verified successfully.")
-            return
+            # Verify all destinations were written
+            dest_results = self._verify_destinations_written()
+            result.destinations = dest_results
 
-        if mode == VerificationMode.SOURCE:
-            self._verify_source_post_copy(result)
-            logging.info("Source integrity verified successfully.")
+            yield CopyEvent(
+                type=EventType.COPY_COMPLETE,
+                bytes_processed=source_size,
+                total_bytes=source_size,
+                message="Copy phase complete",
+            )
 
-        elif mode == VerificationMode.FULL:
-            self._verify_full_post_copy(result)
-            logging.info("Source and all destinations verified successfully.")
+            # Verification phase
+            if self.verification_mode == VerificationMode.TRANSFER:
+                # Already verified sizes during _verify_destinations_written
+                pass
+            elif self.verification_mode == VerificationMode.SOURCE:
+                yield from self._verify_source_only(result)
+            elif self.verification_mode == VerificationMode.FULL:
+                yield from self._verify_full(result)
 
-    def _check_disk_space(self, source_size: int) -> None:
-        """Check if there is enough disk space on all destinations."""
-        for dest in self._destinations:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            usage = shutil.disk_usage(dest.parent)
-            if usage.free < source_size:
-                raise CopyJobError(
-                    f"Not enough space on {dest.parent}. Required: "
-                    f"{source_size / 1e9:.2f}GB, Available: {usage.free / 1e9:.2f}GB"
+        except Exception as e:
+            # Mark all destinations as failed
+            for dest in self.destinations:
+                result.destinations.append(
+                    DestinationResult(path=dest, success=False, error=str(e))
                 )
 
-    def _prepare_destination_dirs(self) -> None:
-        """Ensure all destination parent directories exist."""
-        for dest in self._destinations:
+        finally:
+            result.duration = time.time() - start_time
+
+        yield result
+
+    def abort(self) -> None:
+        """Signal the copy operation to abort."""
+        self._abort_event.set()
+
+    # ------------------------------------------------------------------------
+    # Internal methods
+    # ------------------------------------------------------------------------
+
+    def _check_source_exists(self) -> None:
+        """Verify source file exists and is readable."""
+        if not self.source.exists():
+            raise FileNotFoundError(f"Source file not found: {self.source}")
+        if not self.source.is_file():
+            raise ValueError(f"Source is not a file: {self.source}")
+
+    def _check_disk_space(self, required_bytes: int) -> None:
+        """Verify sufficient disk space on all destinations."""
+        for dest in self.destinations:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(dest.parent)
+            if usage.free < required_bytes:
+                raise OSError(
+                    f"Insufficient space on {dest.parent}: "
+                    f"need {required_bytes / 1e9:.2f} GB, "
+                    f"have {usage.free / 1e9:.2f} GB"
+                )
+
+    def _prepare_destinations(self) -> None:
+        """Create destination directories."""
+        for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-    def _stream_and_dispatch_chunks(
+    def _stream_to_destinations(
         self, source_size: int, enable_hashing: bool
-    ) -> str | None:
-        """Read the source file and dispatch chunks to writer threads."""
-        source_hasher = (
-            HashCalculator(self.config.hash_algorithm) if enable_hashing else None
-        )
-        progress = ProgressTracker(source_size, self._progress_callback)
+    ) -> Iterator[int | str]:
+        """
+        Read source once, fan out to multiple writers.
 
-        chunk_queues = [queue.Queue(maxsize=10) for _ in self._destinations]
+        Yields: bytes_copied (int) during copy, then final hash (str) if enabled.
+        """
+        # Create queues and writer threads
+        chunk_queues = [queue.Queue(maxsize=QUEUE_SIZE) for _ in self.destinations]
         writer_threads = []
-        for i, dest_path in enumerate(self._destinations):
+        writer_errors = {}
+
+        for i, dest_path in enumerate(self.destinations):
             thread = threading.Thread(
-                target=self._writer_thread, args=(dest_path, chunk_queues[i])
+                target=self._writer_thread,
+                args=(dest_path, chunk_queues[i], writer_errors),
+                daemon=True,
             )
             thread.start()
             writer_threads.append(thread)
 
+        # Read source and dispatch chunks
+        hasher = HashCalculator(self.hash_algorithm) if enable_hashing else None
+        bytes_read = 0
+
         try:
-            with open(self._source, "rb") as f_src:
-                while True:
-                    if self._abort_event.is_set():
-                        raise CopyJobError("Operation aborted")
-                    chunk = f_src.read(self.config.buffer_size)
+            with open(self.source, "rb") as f:
+                while not self._abort_event.is_set():
+                    chunk = f.read(BUFFER_SIZE)
                     if not chunk:
                         break
-                    if source_hasher:
-                        source_hasher.update(chunk)
-                    progress.update(len(chunk))
+
+                    if hasher:
+                        hasher.update(chunk)
+
+                    bytes_read += len(chunk)
+
+                    # Distribute to all queues
                     for q in chunk_queues:
                         q.put(chunk)
+
+                    yield bytes_read
+
+                    # Check for writer errors
+                    if writer_errors:
+                        raise OSError(f"Writer errors: {writer_errors}")
+
         finally:
+            # Signal all writers to stop
             for q in chunk_queues:
                 q.put(None)
+
+            # Wait for all writers to finish
             for t in writer_threads:
                 t.join()
 
-        return source_hasher.hexdigest() if source_hasher else None
+            # Check for any writer errors
+            if writer_errors:
+                raise OSError(f"Writer thread errors: {writer_errors}")
 
-    def _writer_thread(self, dest_path: Path, chunk_queue: queue.Queue) -> None:
-        """Target method for writer threads to write chunks to a temporary file."""
-        temp_path = dest_path.with_suffix(f"{dest_path.suffix}.tmp")
+        # Return final hash if enabled
+        if hasher:
+            yield hasher.hexdigest()
+
+    def _writer_thread(
+        self, dest_path: Path, chunk_queue: queue.Queue, error_dict: dict
+    ) -> None:
+        """
+        Writer thread: receives chunks and writes to temp file.
+
+        On success, atomically renames temp to final destination.
+        """
+        temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+
         try:
-            with open(temp_path, "wb") as f_dest:
+            with open(temp_path, "wb") as f:
                 while True:
                     chunk = chunk_queue.get()
-                    if chunk is None:
+                    if chunk is None:  # Sentinel
                         break
                     if self._abort_event.is_set():
-                        break
-                    f_dest.write(chunk)
+                        return
+                    f.write(chunk)
+
+            # Atomic rename on success
             if not self._abort_event.is_set():
-                shutil.move(temp_path, dest_path)
-        except OSError as e:
-            logging.error(f"Error writing to {dest_path}: {e}")
+                temp_path.replace(dest_path)
+
+        except Exception as e:
+            error_dict[dest_path] = str(e)
             self._abort_event.set()
         finally:
+            # Clean up temp file if still exists
             if temp_path.exists():
-                with contextlib.suppress(OSError):
-                    temp_path.unlink()
-
-    def _compare_sizes(self, source_size: int) -> None:
-        """Compare the source file size with all destination file sizes."""
-        for dest in self._destinations:
-            dest_size = dest.stat().st_size
-            if source_size != dest_size:
-                raise CopyJobError(
-                    f"File size mismatch for {dest.name}. Source: {source_size}, Dest: {dest_size}"
-                )
-
-    def _verify_source_post_copy(self, result: FileCopyResult) -> None:
-        """Verify the source file integrity by re-hashing it after the copy."""
-        logging.info(f"Re-hashing source file {self._source.name}...")
-        post_hash = HashCalculator.hash_file(
-            self._source, self.config.hash_algorithm, self.config.buffer_size
-        )
-        result.source_hash_post = post_hash
-        if post_hash != result.source_hash_inflight:
-            result.verified = False
-            raise CopyJobError(
-                f"Source file changed during copy. "
-                f"In-flight: {result.source_hash_inflight}, "
-                f"Post-copy: {post_hash}"
-            )
-
-    def _verify_full_post_copy(self, result: FileCopyResult) -> None:
-        """Verify integrity of the source and all destination files by re-hashing them."""
-        logging.info("Re-hashing source and all destinations in parallel...")
-        files_to_hash = [self._source] + self._destinations
-        hashes = {}
-
-        with ThreadPoolExecutor(max_workers=len(files_to_hash)) as executor:
-            future_to_path = {
-                executor.submit(
-                    HashCalculator.hash_file,
-                    path,
-                    self.config.hash_algorithm,
-                    self.config.buffer_size,
-                ): path
-                for path in files_to_hash
-            }
-            for future in future_to_path:
-                path = future_to_path[future]
                 try:
-                    hashes[path] = future.result()
-                except Exception as e:
-                    raise CopyJobError(f"Failed to hash {path.name} post-copy: {e}")
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
-        result.source_hash_post = hashes[self._source]
-        for dest in self._destinations:
-            result.destination_hashes_post[dest] = hashes[dest]
+    def _verify_destinations_written(self) -> list[DestinationResult]:
+        """
+        Verify all destination files exist and have correct size.
 
-        if result.source_hash_post != result.source_hash_inflight:
-            result.verified = False
-            raise CopyJobError(
-                f"Source file changed during copy. In-flight: {result.source_hash_inflight}, Post-copy: {result.source_hash_post}"
+        Returns list of DestinationResult objects.
+        """
+        results = []
+        source_size = self.source.stat().st_size
+
+        for dest in self.destinations:
+            if not dest.exists():
+                results.append(
+                    DestinationResult(
+                        path=dest,
+                        success=False,
+                        error="Destination file not created",
+                    )
+                )
+                continue
+
+            dest_size = dest.stat().st_size
+            if dest_size != source_size:
+                results.append(
+                    DestinationResult(
+                        path=dest,
+                        success=False,
+                        bytes_written=dest_size,
+                        error=f"Size mismatch: expected {source_size}, got {dest_size}",
+                    )
+                )
+                continue
+
+            # Success (so far)
+            results.append(
+                DestinationResult(
+                    path=dest,
+                    success=True,
+                    bytes_written=dest_size,
+                )
             )
 
-        for dest in self._destinations:
-            if result.destination_hashes_post[dest] != result.source_hash_inflight:
-                result.verified = False
-                logging.error(
-                    f"HASH MISMATCH: {dest.name} hash {result.destination_hashes_post[dest]} != source hash {result.source_hash_inflight}"
-                )
-
-        if not result.verified:
-            raise CopyJobError("Full verification failed: Hashes do not match.")
-
-
-class BatchProcessor:
-    """Manages a batch of copy jobs from a single command-line invocation."""
-
-    def __init__(self, args: argparse.Namespace) -> None:
-        """Initialize the batch processor with command-line arguments."""
-        self.args = args
-        self.config = self._create_config()
-
-    def _create_config(self) -> CopyConfig:
-        """Create a CopyConfig object from command-line arguments."""
-        return CopyConfig(
-            verification_mode=VerificationMode(self.args.mode),
-            hash_algorithm=self.args.hash_algorithm,
-        )
-
-    def run(self) -> bool:
-        """Run the entire batch of copy jobs sequentially and return the overall success."""
-        source_files = self._discover_files()
-        results = self._execute_jobs_sequentially(source_files)
-        return self._final_summary(results)
-
-    def _discover_files(self) -> list[Path]:
-        """
-        Discover all source files to be copied, handling both files and
-        directories.
-        """
-        source = self.args.source
-        if source.is_file():
-            return [source]
-        if source.is_dir():
-            return sorted([f for f in source.rglob("*") if f.is_file()])
-        raise FileNotFoundError(f"Source path {source} does not exist.")
-
-    def _execute_jobs_sequentially(
-        self, source_files: list[Path]
-    ) -> list[FileCopyResult]:
-        """Create, execute, and wait for each CopyJob sequentially."""
-        results = []
-        total_files = len(source_files)
-        for i, file_path in enumerate(source_files):
-            logging.info("-" * 60)
-            logging.info(f"Starting file {i + 1}/{total_files}: {file_path.name}")
-
-            dest_paths = self._get_dest_paths(file_path)
-            job = CopyJob(self.config).source(file_path)
-            for dest in dest_paths:
-                job.add_destination(dest)
-
-            def progress_callback(copied, total):
-                percent = (copied / total * 100) if total > 0 else 0
-                bar = "█" * int(percent / 2) + "–" * (50 - int(percent / 2))
-                sys.stdout.write(f"\rProgress: |{bar}| {percent:.2f}%")
-                sys.stdout.flush()
-
-            job.on_progress(progress_callback)
-
-            try:
-                result = job.execute()  # This blocks until the current job is done
-                if result.error:
-                    logging.error(
-                        f"Result for {result.source_path.name}: FAILED ({result.error})"
-                    )
-                else:
-                    logging.info(f"Result for {result.source_path.name}: SUCCESS")
-                    logging.info(
-                        f"  - Speed: {result.speed_mb_sec:.2f} MB/s, Size: {result.size / (1024 * 1024):.2f} MB ({result.size} bytes)"
-                    )
-                    if result.source_hash_inflight:
-                        logging.info(
-                            f"  - Hash ({self.config.hash_algorithm}): {result.source_hash_inflight}"
-                        )
-                results.append(result)
-            except Exception as e:
-                logging.error(
-                    f"A job for {file_path.name} failed with an unexpected exception: {e}"
-                )
-                results.append(
-                    FileCopyResult(source_path=file_path, verified=False, error=str(e))
-                )
         return results
 
-    def _get_dest_paths(self, source_file: Path) -> list[Path]:
-        """Calculate the full destination paths for a given source file."""
-        # If the master source was a directory, all destinations are roots.
-        if self.args.source.is_dir():
-            relative_path = source_file.relative_to(self.args.source)
-            return [dest_root / relative_path for dest_root in self.args.destinations]
+    def _verify_source_only(self, result: CopyResult) -> Iterator[CopyEvent]:
+        """
+        SOURCE mode: Re-hash source file to ensure it didn't change during copy.
+        """
+        yield CopyEvent(
+            type=EventType.VERIFY_START,
+            total_bytes=result.source_size,
+            message="Verifying source file integrity",
+        )
 
-        # If the master source was a single file.
-        final_dest_paths = []
-        for dest_path in self.args.destinations:
-            if dest_path.is_dir() or (not dest_path.exists() and dest_path.name == ""):
-                # If path is a directory, or looks like one (e.g. `~/tmp/`),
-                # append the source filename.
-                final_dest_paths.append(dest_path / source_file.name)
+        bytes_hashed = 0
+        final_hash = ""
+
+        for bytes_hashed, final_hash in HashCalculator.hash_file(
+            self.source, self.hash_algorithm
+        ):
+            if final_hash:
+                result.source_hash_post = final_hash
             else:
-                # Otherwise, assume the user provided a full destination filepath.
-                final_dest_paths.append(dest_path)
-        return final_dest_paths
+                yield CopyEvent(
+                    type=EventType.VERIFY_PROGRESS,
+                    bytes_processed=bytes_hashed,
+                    total_bytes=result.source_size,
+                )
 
-    def _final_summary(self, results: list[FileCopyResult]) -> bool:
-        """Log a final summary of all operations and return overall success."""
-        logging.info("=" * 60)
-        success_count = sum(1 for r in results if not r.error and r.verified)
-        total_count = len(results)
+        # Check if source changed
+        if result.source_hash_post != result.source_hash_inflight:
+            for dest_result in result.destinations:
+                dest_result.success = False
+                dest_result.error = "Source file changed during copy"
 
-        if success_count == total_count:
-            logging.info(f"All {total_count} operations completed successfully.")
+        yield CopyEvent(
+            type=EventType.VERIFY_COMPLETE,
+            bytes_processed=result.source_size,
+            total_bytes=result.source_size,
+            message="Source verification complete",
+        )
+
+    def _verify_full(self, result: CopyResult) -> Iterator[CopyEvent]:
+        """
+        FULL mode: Hash source and all destinations in parallel.
+        """
+        files_to_hash = [self.source] + self.destinations
+        total_bytes = result.source_size * len(files_to_hash)
+
+        yield CopyEvent(
+            type=EventType.VERIFY_START,
+            total_bytes=total_bytes,
+            message=f"Verifying source + {len(self.destinations)} destination(s)",
+        )
+
+        # Hash all files in parallel using ThreadPoolExecutor
+        hashes = {}
+        bytes_verified = 0
+
+        with ThreadPoolExecutor(max_workers=len(files_to_hash)) as executor:
+            # Submit all hash jobs
+            future_to_path = {
+                executor.submit(self._hash_file_to_completion, path): path
+                for path in files_to_hash
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    file_hash = future.result()
+                    hashes[path] = file_hash
+                    bytes_verified += path.stat().st_size
+
+                    yield CopyEvent(
+                        type=EventType.VERIFY_PROGRESS,
+                        bytes_processed=bytes_verified,
+                        total_bytes=total_bytes,
+                    )
+                except Exception as e:
+                    # Mark this destination as failed
+                    if path != self.source:
+                        for dest_result in result.destinations:
+                            if dest_result.path == path:
+                                dest_result.success = False
+                                dest_result.error = f"Hash failed: {e}"
+
+        # Store hashes in result
+        result.source_hash_post = hashes.get(self.source)
+
+        for dest_result in result.destinations:
+            dest_hash = hashes.get(dest_result.path)
+            dest_result.hash_post = dest_hash
+
+            # Verify hash matches source
+            if dest_result.success and dest_hash != result.source_hash_inflight:
+                dest_result.success = False
+                dest_result.error = (
+                    f"Hash mismatch: {dest_hash} != {result.source_hash_inflight}"
+                )
+
+        # Check if source changed during copy
+        if result.source_hash_post != result.source_hash_inflight:
+            for dest_result in result.destinations:
+                if dest_result.success:
+                    dest_result.success = False
+                    dest_result.error = "Source file changed during copy"
+
+        yield CopyEvent(
+            type=EventType.VERIFY_COMPLETE,
+            bytes_processed=total_bytes,
+            total_bytes=total_bytes,
+            message="Full verification complete",
+        )
+
+    def _hash_file_to_completion(self, path: Path) -> str:
+        """Hash a file completely and return the final digest."""
+        final_hash = ""
+        for _, final_hash in HashCalculator.hash_file(path, self.hash_algorithm):
+            if final_hash:
+                return final_hash
+        return final_hash
+
+
+# ============================================================================
+# CLI Layer (Presentation)
+# ============================================================================
+
+
+class CLIProcessor:
+    """
+    Handles CLI orchestration and presentation using Rich library.
+
+    This layer is completely separate from the core copy engine.
+    """
+
+    def __init__(
+        self,
+        source: Path,
+        destinations: list[Path],
+        verification_mode: VerificationMode,
+        hash_algorithm: str,
+    ):
+        self.source = source
+        self.destinations = destinations
+        self.verification_mode = verification_mode
+        self.hash_algorithm = hash_algorithm
+        self.console = Console()
+
+    def run(self) -> bool:
+        """
+        Execute copy jobs for all source files.
+
+        Returns: True if all operations succeeded.
+        """
+        # Discover files to copy
+        source_files = self._discover_files()
+
+        if not source_files:
+            self.console.print("[yellow]No files to copy[/yellow]")
             return True
-        else:
-            logging.error(
-                f"{total_count - success_count} out of {total_count} operations failed."
+
+        # Execute each copy job
+        results = []
+        for i, source_file in enumerate(source_files, 1):
+            self.console.print(
+                f"\n[bold cyan]File {i}/{len(source_files)}: {source_file.name}[/bold cyan]"
             )
-            return False
+
+            dest_paths = self._calculate_destinations(source_file)
+            result = self._execute_single_copy(source_file, dest_paths)
+            results.append(result)
+
+            # Show result summary
+            self._show_result_summary(result)
+
+            if not result.success:
+                self.console.print("[bold red]Operation failed, stopping.[/bold red]")
+                break
+
+        # Final summary
+        self._show_final_summary(results)
+
+        return all(r.success for r in results)
+
+    def _discover_files(self) -> list[Path]:
+        """Discover all source files to copy."""
+        if self.source.is_file():
+            return [self.source]
+        elif self.source.is_dir():
+            return sorted([f for f in self.source.rglob("*") if f.is_file()])
+        else:
+            raise FileNotFoundError(f"Source not found: {self.source}")
+
+    def _calculate_destinations(self, source_file: Path) -> list[Path]:
+        """Calculate destination paths for a source file."""
+        dest_paths = []
+
+        # If source is a directory, preserve structure
+        if self.source.is_dir():
+            relative_path = source_file.relative_to(self.source)
+            return [dest_root / relative_path for dest_root in self.destinations]
+
+        # Single file source
+        for dest in self.destinations:
+            if dest.is_dir():
+                dest_paths.append(dest / source_file.name)
+            else:
+                dest_paths.append(dest)
+
+        return dest_paths
+
+    def _execute_single_copy(
+        self, source: Path, destinations: list[Path]
+    ) -> CopyResult:
+        """Execute a single copy operation with rich progress display."""
+        engine = CopyEngine(
+            source=source,
+            destinations=destinations,
+            verification_mode=self.verification_mode,
+            hash_algorithm=self.hash_algorithm,
+        )
+
+        result = None
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+        ) as progress:
+            copy_task = None
+            verify_task = None
+
+            for event in engine.copy():
+                if isinstance(event, CopyResult):
+                    result = event
+                    break
+
+                elif event.type == EventType.COPY_START:
+                    copy_task = progress.add_task("Copying", total=event.total_bytes)
+
+                elif event.type == EventType.COPY_PROGRESS:
+                    if copy_task is not None:
+                        progress.update(copy_task, completed=event.bytes_processed)
+
+                elif event.type == EventType.COPY_COMPLETE:
+                    if copy_task is not None:
+                        progress.update(copy_task, completed=event.total_bytes)
+
+                elif event.type == EventType.VERIFY_START:
+                    verify_task = progress.add_task(
+                        "Verifying", total=event.total_bytes
+                    )
+
+                elif event.type == EventType.VERIFY_PROGRESS:
+                    if verify_task is not None:
+                        progress.update(verify_task, completed=event.bytes_processed)
+
+                elif event.type == EventType.VERIFY_COMPLETE:
+                    if verify_task is not None:
+                        progress.update(verify_task, completed=event.total_bytes)
+
+        return result
+
+    def _show_result_summary(self, result: CopyResult) -> None:
+        """Display a summary of a single copy operation."""
+        if result.success:
+            self.console.print(
+                f"[green]✓ Success[/green] "
+                f"({result.speed_mb_sec:.2f} MB/s, "
+                f"{result.source_size / (1024 * 1024):.2f} MB)"
+            )
+            if result.source_hash_inflight:
+                self.console.print(
+                    f"  Hash ({self.hash_algorithm}): {result.source_hash_inflight}"
+                )
+        else:
+            self.console.print("[red]✗ Failed[/red]")
+            for dest_result in result.destinations:
+                if not dest_result.success:
+                    self.console.print(
+                        f"  [red]✗ {dest_result.path.name}: {dest_result.error}[/red]"
+                    )
+
+    def _show_final_summary(self, results: list[CopyResult]) -> None:
+        """Display final summary of all operations."""
+        self.console.print("\n" + "=" * 60)
+
+        total = len(results)
+        success = sum(1 for r in results if r.success)
+        failed = total - success
+
+        if failed == 0:
+            self.console.print(
+                f"[bold green]All {total} operation(s) completed successfully[/bold green]"
+            )
+        else:
+            self.console.print(
+                f"[bold red]{failed} of {total} operation(s) failed[/bold red]"
+            )
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 
 def main() -> int:
-    """Main function for the cvv command-line tool."""
-    parser = argparse.ArgumentParser(description="Professional file copying tool.")
-    parser.add_argument("source", type=Path, help="Source file or directory.")
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Professional file copying tool with integrity verification",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cvv source.mp4 /dest1 /dest2              # Copy to 2 destinations with full verification
+  cvv source.mp4 /dest1 -m transfer         # Fast copy with size check only
+  cvv /source_dir /dest_dir -m full         # Copy entire directory with verification
+        """,
+    )
+
+    parser.add_argument(
+        "source",
+        type=Path,
+        help="Source file or directory to copy",
+    )
+
     parser.add_argument(
         "destinations",
         type=Path,
         nargs="+",
-        help="One or more destination files or directories.",
+        help="One or more destination paths",
     )
+
     parser.add_argument(
         "-m",
         "--mode",
         type=str,
         default="full",
         choices=["transfer", "source", "full"],
-        help="Verification mode.",
+        help="Verification mode (default: full)",
     )
+
     parser.add_argument(
         "--hash-algorithm",
         type=str,
         default="xxh64be",
         choices=["xxh64be", "md5", "sha1", "sha256"],
-        help="Hash algorithm for verification.",
+        help="Hash algorithm for verification (default: xxh64be)",
     )
+
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose logging."
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
     )
+
     args = parser.parse_args()
 
+    # Configure logging
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        stream=sys.stdout,
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s: %(message)s",
     )
 
+    # Run the CLI processor
     try:
-        processor = BatchProcessor(args)
+        processor = CLIProcessor(
+            source=args.source,
+            destinations=args.destinations,
+            verification_mode=VerificationMode(args.mode),
+            hash_algorithm=args.hash_algorithm,
+        )
+
         success = processor.run()
         return 0 if success else 1
-    except (CopyJobError, FileNotFoundError) as e:
-        logging.error(f"Critical error: {e}")
-        return 1
+
     except KeyboardInterrupt:
-        logging.warning("\nOperation interrupted by user.")
-        # TODO: Gracefully abort jobs
+        Console().print("\n[yellow]Operation interrupted by user[/yellow]")
+        return 130
+    except Exception as e:
+        Console().print(f"[bold red]Error: {e}[/bold red]")
+        if args.verbose:
+            import traceback
+
+            traceback.print_exc()
         return 1
 
 
