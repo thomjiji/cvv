@@ -234,8 +234,8 @@ class TestVerificationModes(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_transfer_mode_no_hashing(self) -> None:
-        """Test TRANSFER mode - size check only, no hashing."""
+    def test_transfer_mode_hashing(self) -> None:
+        """Test TRANSFER mode - hashes in-flight but no post-copy verification."""
         dest = self.test_path / "dest.txt"
 
         engine = CopyEngine(
@@ -250,7 +250,9 @@ class TestVerificationModes(unittest.TestCase):
                 result = event
 
         self.assertTrue(result.success)
-        self.assertIsNone(result.source_hash_inflight)  # No hash in TRANSFER mode
+        # TRANSFER mode now computes in-flight hash (essentially free)
+        self.assertIsNotNone(result.source_hash_inflight)
+        # But doesn't do post-copy verification
         self.assertIsNone(result.source_hash_post)
 
     def test_source_mode_hashing(self) -> None:

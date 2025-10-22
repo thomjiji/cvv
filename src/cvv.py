@@ -227,7 +227,9 @@ class CopyEngine:
             )
 
             bytes_copied = 0
-            enable_hashing = self.verification_mode != VerificationMode.TRANSFER
+            # Always enable in-flight hashing - it's essentially free
+            # We just won't do post-copy verification in TRANSFER mode
+            enable_hashing = True
 
             for event_or_hash in self._stream_to_destinations(
                 source_size, enable_hashing
@@ -721,10 +723,46 @@ class CLIProcessor:
                 f"({result.speed_mb_sec:.2f} MB/s, "
                 f"{result.source_size / (1024 * 1024):.2f} MB)"
             )
-            if result.source_hash_inflight:
-                self.console.print(
-                    f"  Hash ({self.hash_algorithm}): {result.source_hash_inflight}"
-                )
+
+            # Display hash information based on verification mode
+            if result.verification_mode == VerificationMode.TRANSFER:
+                # TRANSFER: Show in-flight hash
+                if result.source_hash_inflight:
+                    self.console.print(
+                        f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}"
+                    )
+
+            elif result.verification_mode == VerificationMode.SOURCE:
+                # SOURCE: Show both in-flight and post-copy hashes
+                if result.source_hash_inflight:
+                    self.console.print(
+                        f"  Source hash (in-flight):  {result.source_hash_inflight}"
+                    )
+                if result.source_hash_post:
+                    match_indicator = "✓" if result.source_hash_post == result.source_hash_inflight else "✗"
+                    self.console.print(
+                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
+                    )
+
+            elif result.verification_mode == VerificationMode.FULL:
+                # FULL: Show source hashes and all destination hashes
+                if result.source_hash_inflight:
+                    self.console.print(
+                        f"  Source hash (in-flight):  {result.source_hash_inflight}"
+                    )
+                if result.source_hash_post:
+                    match_indicator = "✓" if result.source_hash_post == result.source_hash_inflight else "✗"
+                    self.console.print(
+                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
+                    )
+
+                # Show each destination hash
+                for dest_result in result.destinations:
+                    if dest_result.hash_post:
+                        match_indicator = "✓" if dest_result.hash_post == result.source_hash_inflight else "✗"
+                        self.console.print(
+                            f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
+                        )
         else:
             self.console.print("[red]✗ Failed[/red]")
             for dest_result in result.destinations:
