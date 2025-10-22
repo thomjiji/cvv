@@ -14,6 +14,7 @@ Architecture:
 """
 
 import argparse
+import contextlib
 import hashlib
 import logging
 import queue
@@ -400,10 +401,8 @@ class CopyEngine:
         finally:
             # Clean up temp file if still exists
             if temp_path.exists():
-                try:
+                with contextlib.suppress(Exception):
                     temp_path.unlink()
-                except Exception:
-                    pass
 
     def _verify_destinations_written(self) -> list[DestinationResult]:
         """
