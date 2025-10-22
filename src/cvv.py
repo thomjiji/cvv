@@ -202,16 +202,18 @@ class CopyEngine:
         Yields CopyEvent objects during operation, final yield is CopyResult.
         """
         start_time = time.time()
-        source_size = self.source.stat().st_size
 
-        # Initialize result
+        # Initialize result with defaults (will be updated if source exists)
         result = CopyResult(
             source_path=self.source,
-            source_size=source_size,
+            source_size=0,
             verification_mode=self.verification_mode,
         )
 
         try:
+            # Get source size (may fail if source doesn't exist)
+            source_size = self.source.stat().st_size
+            result.source_size = source_size
             # Pre-flight checks
             self._check_source_exists()
             self._check_disk_space(source_size)
