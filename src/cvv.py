@@ -490,7 +490,7 @@ class CopyEngine:
 
     def _verify_full(self, result: CopyResult) -> Iterator[CopyEvent]:
         """
-        FULL mode: Hash source and all destinations in parallel.
+        FULL mode: Hash source and all destinations in parallel with real-time progress.
         """
         files_to_hash = [self.source] + self.destinations
         total_bytes = result.source_size * len(files_to_hash)
@@ -501,30 +501,68 @@ class CopyEngine:
             message=f"Verifying source + {len(self.destinations)} destination(s)",
         )
 
-        # Hash all files in parallel using ThreadPoolExecutor
+        # Shared progress counter (thread-safe) tracks bytes hashed across all threads
+        progress_lock = threading.Lock()
+        shared_progress = {"bytes_hashed": 0}
+
+        def hash_file_with_progress(path: Path) -> tuple[Path, str]:
+            """Hash a file and update shared progress counter in real-time."""
+            final_hash = ""
+            last_bytes = 0
+
+            for bytes_hashed, final_hash in HashCalculator.hash_file(
+                path, self.hash_algorithm
+            ):
+                if not final_hash:
+                    # Progress update - report delta since last update
+                    delta = bytes_hashed - last_bytes
+                    last_bytes = bytes_hashed
+
+                    with progress_lock:
+                        shared_progress["bytes_hashed"] += delta
+
+            # Return final hash
+            return (path, final_hash)
+
+        # Hash all files in parallel
         hashes = {}
-        bytes_verified = 0
 
         with ThreadPoolExecutor(max_workers=len(files_to_hash)) as executor:
             # Submit all hash jobs
             future_to_path = {
-                executor.submit(self._hash_file_to_completion, path): path
+                executor.submit(hash_file_with_progress, path): path
                 for path in files_to_hash
             }
 
-            # Collect results as they complete
-            for future in as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    file_hash = future.result()
-                    hashes[path] = file_hash
-                    bytes_verified += path.stat().st_size
+            # Poll shared progress and yield events
+            last_reported = 0
+            all_done = False
 
+            while not all_done:
+                # Check current progress
+                with progress_lock:
+                    current_bytes = shared_progress["bytes_hashed"]
+
+                # Yield progress if changed
+                if current_bytes > last_reported:
                     yield CopyEvent(
                         type=EventType.VERIFY_PROGRESS,
-                        bytes_processed=bytes_verified,
+                        bytes_processed=current_bytes,
                         total_bytes=total_bytes,
                     )
+                    last_reported = current_bytes
+
+                # Check if all futures are done
+                all_done = all(f.done() for f in future_to_path.keys())
+
+                if not all_done:
+                    time.sleep(0.02)  # Poll every 20ms for smooth progress
+
+            # Collect results
+            for future, path in future_to_path.items():
+                try:
+                    path_result, file_hash = future.result()
+                    hashes[path_result] = file_hash
                 except Exception as e:
                     # Mark this destination as failed
                     if path != self.source:
