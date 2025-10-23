@@ -35,23 +35,13 @@ except ImportError:
     print("Please install it using: pip install xxhash", file=sys.stderr)
     sys.exit(1)
 
+# Rich library is optional - we use simple text progress instead
+RICH_AVAILABLE = False
 try:
     from rich.console import Console
-    from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        DownloadColumn,
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        TimeRemainingColumn,
-        TransferSpeedColumn,
-    )
-    from rich.table import Table
+    RICH_AVAILABLE = True
 except ImportError:
-    print("ERROR: The 'rich' library is required but not installed.", file=sys.stderr)
-    print("Please install it using: pip install rich", file=sys.stderr)
-    sys.exit(1)
+    pass  # Will use simple text progress
 
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
@@ -631,7 +621,6 @@ class CLIProcessor:
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
-        self.console = Console()
 
     def run(self) -> bool:
         """
@@ -643,15 +632,13 @@ class CLIProcessor:
         source_files = self._discover_files()
 
         if not source_files:
-            self.console.print("[yellow]No files to copy[/yellow]")
+            print("No files to copy")
             return True
 
         # Execute each copy job
         results = []
         for i, source_file in enumerate(source_files, 1):
-            self.console.print(
-                f"\n[bold cyan]File {i}/{len(source_files)}: {source_file.name}[/bold cyan]"
-            )
+            print(f"\nFile {i}/{len(source_files)}: {source_file.name}")
 
             dest_paths = self._calculate_destinations(source_file)
             result = self._execute_single_copy(source_file, dest_paths)
@@ -661,7 +648,7 @@ class CLIProcessor:
             self._show_result_summary(result)
 
             if not result.success:
-                self.console.print("[bold red]Operation failed, stopping.[/bold red]")
+                print("Operation failed, stopping.")
                 break
 
         # Final summary
@@ -699,7 +686,7 @@ class CLIProcessor:
     def _execute_single_copy(
         self, source: Path, destinations: list[Path]
     ) -> CopyResult:
-        """Execute a single copy operation with rich progress display."""
+        """Execute a single copy operation with simple text progress."""
         engine = CopyEngine(
             source=source,
             destinations=destinations,
@@ -708,55 +695,47 @@ class CLIProcessor:
         )
 
         result = None
+        copy_total = 0
+        verify_total = 0
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            console=self.console,
-        ) as progress:
-            copy_task = None
-            verify_task = None
+        for event in engine.copy():
+            if isinstance(event, CopyResult):
+                result = event
+                sys.stdout.write("\n")  # Newline after progress
+                sys.stdout.flush()
+                break
 
-            for event in engine.copy():
-                if isinstance(event, CopyResult):
-                    result = event
-                    break
+            elif event.type == EventType.COPY_START:
+                copy_total = event.total_bytes
 
-                elif event.type == EventType.COPY_START:
-                    copy_task = progress.add_task("Copying", total=event.total_bytes)
+            elif event.type == EventType.COPY_PROGRESS:
+                percent = (event.bytes_processed / copy_total * 100) if copy_total else 0
+                mb_done = event.bytes_processed / (1024 * 1024)
+                mb_total = copy_total / (1024 * 1024)
+                # Clear line and write progress
+                sys.stdout.write(f"\rCopying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(80))
+                sys.stdout.flush()
 
-                elif event.type == EventType.COPY_PROGRESS:
-                    if copy_task is not None:
-                        progress.update(copy_task, completed=event.bytes_processed)
+            elif event.type == EventType.VERIFY_START:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                verify_total = event.total_bytes
 
-                elif event.type == EventType.COPY_COMPLETE:
-                    if copy_task is not None:
-                        progress.update(copy_task, completed=event.total_bytes)
-
-                elif event.type == EventType.VERIFY_START:
-                    verify_task = progress.add_task(
-                        "Verifying", total=event.total_bytes
-                    )
-
-                elif event.type == EventType.VERIFY_PROGRESS:
-                    if verify_task is not None:
-                        progress.update(verify_task, completed=event.bytes_processed)
-
-                elif event.type == EventType.VERIFY_COMPLETE:
-                    if verify_task is not None:
-                        progress.update(verify_task, completed=event.total_bytes)
+            elif event.type == EventType.VERIFY_PROGRESS:
+                percent = (event.bytes_processed / verify_total * 100) if verify_total else 0
+                mb_done = event.bytes_processed / (1024 * 1024)
+                mb_total = verify_total / (1024 * 1024)
+                # Clear line and write progress
+                sys.stdout.write(f"\rVerifying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(80))
+                sys.stdout.flush()
 
         return result
 
     def _show_result_summary(self, result: CopyResult) -> None:
         """Display a summary of a single copy operation."""
         if result.success:
-            self.console.print(
-                f"[green]✓ Success[/green] "
+            print(
+                f"✓ Success "
                 f"({result.speed_mb_sec:.2f} MB/s, "
                 f"{result.source_size / (1024 * 1024):.2f} MB)"
             )
@@ -765,41 +744,31 @@ class CLIProcessor:
             if result.verification_mode == VerificationMode.TRANSFER:
                 # TRANSFER: Show in-flight hash
                 if result.source_hash_inflight:
-                    self.console.print(
-                        f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}"
-                    )
+                    print(f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}")
 
             elif result.verification_mode == VerificationMode.SOURCE:
                 # SOURCE: Show both in-flight and post-copy hashes
                 if result.source_hash_inflight:
-                    self.console.print(
-                        f"  Source hash (in-flight):  {result.source_hash_inflight}"
-                    )
+                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
                 if result.source_hash_post:
                     match_indicator = (
                         "✓"
                         if result.source_hash_post == result.source_hash_inflight
                         else "✗"
                     )
-                    self.console.print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
+                    print(f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]")
 
             elif result.verification_mode == VerificationMode.FULL:
                 # FULL: Show source hashes and all destination hashes
                 if result.source_hash_inflight:
-                    self.console.print(
-                        f"  Source hash (in-flight):  {result.source_hash_inflight}"
-                    )
+                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
                 if result.source_hash_post:
                     match_indicator = (
                         "✓"
                         if result.source_hash_post == result.source_hash_inflight
                         else "✗"
                     )
-                    self.console.print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
+                    print(f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]")
 
                 # Show each destination hash
                 for dest_result in result.destinations:
@@ -809,33 +778,25 @@ class CLIProcessor:
                             if dest_result.hash_post == result.source_hash_inflight
                             else "✗"
                         )
-                        self.console.print(
-                            f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
-                        )
+                        print(f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]")
         else:
-            self.console.print("[red]✗ Failed[/red]")
+            print("✗ Failed")
             for dest_result in result.destinations:
                 if not dest_result.success:
-                    self.console.print(
-                        f"  [red]✗ {dest_result.path.name}: {dest_result.error}[/red]"
-                    )
+                    print(f"  ✗ {dest_result.path.name}: {dest_result.error}")
 
     def _show_final_summary(self, results: list[CopyResult]) -> None:
         """Display final summary of all operations."""
-        self.console.print("\n" + "=" * 60)
+        print("\n" + "=" * 60)
 
         total = len(results)
         success = sum(1 for r in results if r.success)
         failed = total - success
 
         if failed == 0:
-            self.console.print(
-                f"[bold green]All {total} operation(s) completed successfully[/bold green]"
-            )
+            print(f"All {total} operation(s) completed successfully")
         else:
-            self.console.print(
-                f"[bold red]{failed} of {total} operation(s) failed[/bold red]"
-            )
+            print(f"{failed} of {total} operation(s) failed")
 
 
 # ============================================================================
@@ -914,13 +875,12 @@ Examples:
         return 0 if success else 1
 
     except KeyboardInterrupt:
-        Console().print("\n[yellow]Operation interrupted by user[/yellow]")
+        print("\nOperation interrupted by user")
         return 130
     except Exception as e:
-        Console().print(f"[bold red]Error: {e}[/bold red]")
+        print(f"Error: {e}")
         if args.verbose:
             import traceback
-
             traceback.print_exc()
         return 1
 
