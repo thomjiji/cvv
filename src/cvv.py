@@ -553,7 +553,7 @@ class CopyEngine:
                     last_reported = current_bytes
 
                 # Check if all futures are done
-                all_done = all(f.done() for f in future_to_path.keys())
+                all_done = all(f.done() for f in future_to_path)
 
                 if not all_done:
                     time.sleep(0.02)  # Poll every 20ms for smooth progress
