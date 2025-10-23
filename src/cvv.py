@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -34,14 +34,6 @@ except ImportError:
     print("ERROR: The 'xxhash' library is required but not installed.", file=sys.stderr)
     print("Please install it using: pip install xxhash", file=sys.stderr)
     sys.exit(1)
-
-# Rich library is optional - we use simple text progress instead
-RICH_AVAILABLE = False
-try:
-    from rich.console import Console
-    RICH_AVAILABLE = True
-except ImportError:
-    pass  # Will use simple text progress
 
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
@@ -709,11 +701,17 @@ class CLIProcessor:
                 copy_total = event.total_bytes
 
             elif event.type == EventType.COPY_PROGRESS:
-                percent = (event.bytes_processed / copy_total * 100) if copy_total else 0
+                percent = (
+                    (event.bytes_processed / copy_total * 100) if copy_total else 0
+                )
                 mb_done = event.bytes_processed / (1024 * 1024)
                 mb_total = copy_total / (1024 * 1024)
                 # Clear line and write progress
-                sys.stdout.write(f"\rCopying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(80))
+                sys.stdout.write(
+                    f"\rCopying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
+                        80
+                    )
+                )
                 sys.stdout.flush()
 
             elif event.type == EventType.VERIFY_START:
@@ -722,11 +720,17 @@ class CLIProcessor:
                 verify_total = event.total_bytes
 
             elif event.type == EventType.VERIFY_PROGRESS:
-                percent = (event.bytes_processed / verify_total * 100) if verify_total else 0
+                percent = (
+                    (event.bytes_processed / verify_total * 100) if verify_total else 0
+                )
                 mb_done = event.bytes_processed / (1024 * 1024)
                 mb_total = verify_total / (1024 * 1024)
                 # Clear line and write progress
-                sys.stdout.write(f"\rVerifying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(80))
+                sys.stdout.write(
+                    f"\rVerifying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
+                        80
+                    )
+                )
                 sys.stdout.flush()
 
         return result
@@ -744,7 +748,9 @@ class CLIProcessor:
             if result.verification_mode == VerificationMode.TRANSFER:
                 # TRANSFER: Show in-flight hash
                 if result.source_hash_inflight:
-                    print(f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}")
+                    print(
+                        f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}"
+                    )
 
             elif result.verification_mode == VerificationMode.SOURCE:
                 # SOURCE: Show both in-flight and post-copy hashes
@@ -756,7 +762,9 @@ class CLIProcessor:
                         if result.source_hash_post == result.source_hash_inflight
                         else "✗"
                     )
-                    print(f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]")
+                    print(
+                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
+                    )
 
             elif result.verification_mode == VerificationMode.FULL:
                 # FULL: Show source hashes and all destination hashes
@@ -768,7 +776,9 @@ class CLIProcessor:
                         if result.source_hash_post == result.source_hash_inflight
                         else "✗"
                     )
-                    print(f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]")
+                    print(
+                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
+                    )
 
                 # Show each destination hash
                 for dest_result in result.destinations:
@@ -778,7 +788,9 @@ class CLIProcessor:
                             if dest_result.hash_post == result.source_hash_inflight
                             else "✗"
                         )
-                        print(f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]")
+                        print(
+                            f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
+                        )
         else:
             print("✗ Failed")
             for dest_result in result.destinations:
@@ -881,6 +893,7 @@ Examples:
         print(f"Error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 
