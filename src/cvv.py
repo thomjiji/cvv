@@ -316,6 +316,8 @@ class CopyEngine:
         # Read source and dispatch chunks
         hasher = HashCalculator(self.hash_algorithm) if enable_hashing else None
         bytes_read = 0
+        last_progress_time = time.time()
+        progress_interval = 0.1  # Throttle progress to max 10 updates/second
 
         try:
             with open(self.source, "rb") as f:
@@ -333,7 +335,11 @@ class CopyEngine:
                     for q in chunk_queues:
                         q.put(chunk)
 
-                    yield bytes_read
+                    # Throttle progress updates to reduce CPU usage
+                    current_time = time.time()
+                    if current_time - last_progress_time >= progress_interval:
+                        yield bytes_read
+                        last_progress_time = current_time
 
                     # Check for writer errors
                     if writer_errors:
@@ -351,6 +357,10 @@ class CopyEngine:
             # Check for any writer errors
             if writer_errors:
                 raise OSError(f"Writer thread errors: {writer_errors}")
+
+        # Yield final progress to ensure 100% is shown
+        if bytes_read > 0:
+            yield bytes_read
 
         # Return final hash if enabled
         if hasher:
@@ -538,7 +548,7 @@ class CopyEngine:
                 all_done = all(f.done() for f in future_to_path)
 
                 if not all_done:
-                    time.sleep(0.02)  # Poll every 20ms for smooth progress
+                    time.sleep(0.1)  # Poll every 100ms (reduces CPU usage)
 
             # Collect results
             for future, path in future_to_path.items():
