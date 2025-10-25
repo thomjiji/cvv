@@ -1,0 +1,24 @@
+File 1579/2126: 251024_HH_70018.MP4
+Copying: 100.0% (2176.3/2176.3 MB)
+Verifying: 100.0% (4352.6/4352.6 MB)
+✓ Success (600.89 MB/s, 2176.30 MB)
+  Source hash (in-flight):  8ac9d71e995783ef
+  Source hash (post-copy):  8ac9d71e995783ef [✓]
+  251024_HH_70018.MP4: 8ac9d71e995783ef [✓]
+
+File 1580/2126: 251024_HH_70018M01.XML
+Copying: 100.0% (0.0/0.0 MB)
+Verifying: 100.0% (0.0/0.0 MB)
+✓ Success (0.02 MB/s, 0.00 MB)
+  Source hash (in-flight):  9bc7cd9822ff4923
+  Source hash (post-copy):  9bc7cd9822ff4923 [✓]
+  251024_HH_70018M01.XML: 9bc7cd9822ff4923 [✓]
+
+File 1581/2126: 251024_HH_70019.MP4
+Copying: 100.0% (2368.3/2368.3 MB)
+Verifying: 100.0% (4736.6/4736.6 MB)
+✓ Success (590.95 MB/s, 2368.30 MB)
+  Source hash (in-flight):  1bf72e888ed746bb
+  Source hash (post-copy):  1bf72e888ed746bb [✓]
+  251024_HH_70019.MP4: 1bf72e888ed746bb [✓]
+
