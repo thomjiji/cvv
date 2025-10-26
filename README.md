@@ -1,4 +1,4 @@
-# offload-ai - Professional File Copy Tools for DIT Workflows
+# cvv - Professional File Copy Tools for DIT Workflows
 
 A Python implementation of professional file copying tools inspired by Offload Manager's `pfndispatchcopy`, designed for reliable file copying with integrity verification in professional DIT (Digital Imaging Technician) workflows.
 
@@ -16,7 +16,7 @@ A Python implementation of professional file copying tools inspired by Offload M
 ## 📁 Project Structure
 
 ```
-offload-ai/
+cvv/
 ├── src/
 │   ├── __init__.py              # Package initialization
 │   └── pfndispatchcopy.py       # Main implementation
@@ -43,7 +43,7 @@ offload-ai/
 
    ```bash
    git clone <repository-url>
-   cd offload-ai
+   cd cvv
    ```
 
 2. Create a virtual environment (recommended):
@@ -231,7 +231,7 @@ INFO: done.
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd offload-ai
+cd cvv
 
 # Create virtual environment
 python3 -m venv .venv
