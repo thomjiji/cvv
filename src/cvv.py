@@ -19,6 +19,7 @@ import hashlib
 import logging
 import queue
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -86,6 +87,16 @@ class DestinationResult:
 
 
 @dataclass
+class ResumeInfo:
+    """Information about resumable .tmp files."""
+
+    dest_path: Path
+    tmp_path: Path
+    bytes_written: int
+    progress_percent: float
+
+
+@dataclass
 class CopyResult:
     """Complete result of a multi-destination copy operation."""
 
@@ -136,7 +147,9 @@ class HashCalculator:
         return self._hasher.hexdigest()
 
     @staticmethod
-    def hash_file(path: Path, algorithm: str = "xxh64be") -> Iterator[tuple[int, str]]:
+    def hash_file(
+        path: Path, algorithm: str = "xxh64be", abort_event: threading.Event | None = None
+    ) -> Iterator[tuple[int, str]]:
         """
         Hash a file and yield progress.
 
@@ -148,6 +161,9 @@ class HashCalculator:
 
         with open(path, "rb") as f:
             while chunk := f.read(BUFFER_SIZE):
+                # Check for abort
+                if abort_event and abort_event.is_set():
+                    raise InterruptedError("Hash operation interrupted")
                 hasher.update(chunk)
                 total_bytes += len(chunk)
                 yield (total_bytes, "")
@@ -169,12 +185,28 @@ class CopyEngine:
         destinations: list[Path],
         verification_mode: VerificationMode = VerificationMode.FULL,
         hash_algorithm: str = "xxh64be",
+        resume_info: dict[Path, ResumeInfo] | None = None,
     ):
         self.source = source
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
+        self.resume_info = resume_info or {}
         self._abort_event = threading.Event()
+        self._interrupted = False
+
+        # Install signal handler for graceful Ctrl+C
+        signal.signal(signal.SIGINT, self._handle_interrupt)
+
+    def _handle_interrupt(self, signum, frame):
+        """Handle Ctrl+C gracefully - preserve .tmp files for resume."""
+        if not self._interrupted:
+            self._interrupted = True
+            self._abort_event.set()
+            print(
+                "\n\nCopy interrupted. Re-run the same command to resume.",
+                file=sys.stderr,
+            )
 
     def copy(self) -> Iterator[CopyEvent | CopyResult]:
         """
@@ -247,6 +279,10 @@ class CopyEngine:
             elif self.verification_mode == VerificationMode.FULL:
                 yield from self._verify_full(result)
 
+        except InterruptedError:
+            # User pressed Ctrl+C - exit gracefully
+            # .tmp files are preserved for resume
+            pass
         except Exception as e:
             # Mark all destinations as failed
             for dest in self.destinations:
@@ -291,6 +327,37 @@ class CopyEngine:
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
+    def _restore_hash_state(
+        self, dest_path: Path, bytes_to_hash: int
+    ) -> HashCalculator:
+        """
+        Restore hash state by re-hashing existing .tmp file content.
+
+        Returns: HashCalculator with state matching the resume position.
+        """
+        hasher = HashCalculator(self.hash_algorithm)
+        tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+
+        if bytes_to_hash == 0:
+            return hasher
+
+        # Re-hash the existing .tmp content
+        bytes_hashed = 0
+        with open(tmp_path, "rb") as f:
+            while bytes_hashed < bytes_to_hash:
+                # Check for abort
+                if self._abort_event.is_set():
+                    raise InterruptedError("Hash restoration interrupted")
+
+                chunk_size = min(BUFFER_SIZE, bytes_to_hash - bytes_hashed)
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                bytes_hashed += len(chunk)
+
+        return hasher
+
     def _stream_to_destinations(
         self, source_size: int, enable_hashing: bool
     ) -> Iterator[int | str]:
@@ -298,6 +365,27 @@ class CopyEngine:
         Read source once, fan out to multiple writers.
 
         Yields: bytes_copied (int) during copy, then final hash (str) if enabled.
+        """
+        # Check if we need independent resume (different byte positions)
+        resume_positions = [
+            self.resume_info.get(dest, ResumeInfo(dest, dest, 0, 0)).bytes_written
+            for dest in self.destinations
+        ]
+        min_position = min(resume_positions)
+        max_position = max(resume_positions)
+
+        # If all destinations at same position, use parallel fan-out
+        # Otherwise, use sequential copying for simplicity
+        if min_position == max_position:
+            yield from self._stream_parallel(source_size, enable_hashing, min_position)
+        else:
+            yield from self._stream_sequential(source_size, enable_hashing)
+
+    def _stream_parallel(
+        self, source_size: int, enable_hashing: bool, resume_from: int
+    ) -> Iterator[int | str]:
+        """
+        Parallel fan-out streaming (all destinations at same position).
         """
         # Create queues and writer threads
         chunk_queues = [queue.Queue(maxsize=QUEUE_SIZE) for _ in self.destinations]
@@ -307,20 +395,31 @@ class CopyEngine:
         for i, dest_path in enumerate(self.destinations):
             thread = threading.Thread(
                 target=self._writer_thread,
-                args=(dest_path, chunk_queues[i], writer_errors),
+                args=(dest_path, chunk_queues[i], writer_errors, resume_from > 0),
                 daemon=True,
             )
             thread.start()
             writer_threads.append(thread)
 
-        # Read source and dispatch chunks
-        hasher = HashCalculator(self.hash_algorithm) if enable_hashing else None
-        bytes_read = 0
+        # Restore hash state if resuming
+        hasher = None
+        if enable_hashing and resume_from > 0:
+            # Restore hash state by re-hashing first .tmp file
+            print(f"Restoring hash state ({resume_from / (1024 * 1024):.1f} MB)...")
+            hasher = self._restore_hash_state(self.destinations[0], resume_from)
+        elif enable_hashing:
+            hasher = HashCalculator(self.hash_algorithm)
+
+        bytes_read = resume_from
         last_progress_time = time.time()
         progress_interval = 0.1  # Throttle progress to max 10 updates/second
 
         try:
             with open(self.source, "rb") as f:
+                # Seek to resume position
+                if resume_from > 0:
+                    f.seek(resume_from)
+
                 while not self._abort_event.is_set():
                     chunk = f.read(BUFFER_SIZE)
                     if not chunk:
@@ -366,8 +465,84 @@ class CopyEngine:
         if hasher:
             yield hasher.hexdigest()
 
+    def _stream_sequential(
+        self, source_size: int, enable_hashing: bool
+    ) -> Iterator[int | str]:
+        """
+        Sequential streaming (destinations at different resume positions).
+        """
+        # Process each destination independently
+        hashers = {}
+
+        for dest_path in self.destinations:
+            resume_info = self.resume_info.get(dest_path)
+            resume_from = resume_info.bytes_written if resume_info else 0
+
+            # Restore or create hasher for this destination
+            if enable_hashing and resume_from > 0:
+                print(
+                    f"Restoring {dest_path.name} hash state ({resume_from / (1024 * 1024):.1f} MB)..."
+                )
+                hasher = self._restore_hash_state(dest_path, resume_from)
+            elif enable_hashing:
+                hasher = HashCalculator(self.hash_algorithm)
+            else:
+                hasher = None
+
+            hashers[dest_path] = hasher
+
+            # Copy remaining bytes to this destination
+            temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+            mode = "ab" if resume_from > 0 else "wb"
+
+            bytes_written = resume_from
+            last_progress_time = time.time()
+            progress_interval = 0.1
+
+            try:
+                with open(self.source, "rb") as f_in, open(temp_path, mode) as f_out:
+                    if resume_from > 0:
+                        f_in.seek(resume_from)
+
+                    while not self._abort_event.is_set():
+                        chunk = f_in.read(BUFFER_SIZE)
+                        if not chunk:
+                            break
+
+                        f_out.write(chunk)
+                        if hasher:
+                            hasher.update(chunk)
+
+                        bytes_written += len(chunk)
+
+                        # Throttle progress
+                        current_time = time.time()
+                        if current_time - last_progress_time >= progress_interval:
+                            yield bytes_written
+                            last_progress_time = current_time
+
+                # Atomic rename
+                if not self._abort_event.is_set():
+                    temp_path.replace(dest_path)
+
+            except Exception as e:
+                raise OSError(f"Error writing {dest_path}: {e}")
+
+        # Yield final progress
+        yield source_size
+
+        # Return hash from first destination (they should all match)
+        if enable_hashing:
+            first_hasher = hashers[self.destinations[0]]
+            if first_hasher:
+                yield first_hasher.hexdigest()
+
     def _writer_thread(
-        self, dest_path: Path, chunk_queue: queue.Queue, error_dict: dict
+        self,
+        dest_path: Path,
+        chunk_queue: queue.Queue,
+        error_dict: dict,
+        append_mode: bool = False,
     ) -> None:
         """
         Writer thread: receives chunks and writes to temp file.
@@ -375,9 +550,10 @@ class CopyEngine:
         On success, atomically renames temp to final destination.
         """
         temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+        mode = "ab" if append_mode else "wb"
 
         try:
-            with open(temp_path, "wb") as f:
+            with open(temp_path, mode) as f:
                 while True:
                     chunk = chunk_queue.get()
                     if chunk is None:  # Sentinel
@@ -394,10 +570,12 @@ class CopyEngine:
             error_dict[dest_path] = str(e)
             self._abort_event.set()
         finally:
-            # Clean up temp file if still exists
-            if temp_path.exists():
-                with contextlib.suppress(Exception):
-                    temp_path.unlink()
+            # Clean up temp file if interrupted (keep .tmp on Ctrl+C for resume)
+            if self._abort_event.is_set() and not self._interrupted:
+                # Only delete on real error, not on Ctrl+C
+                if temp_path.exists():
+                    with contextlib.suppress(Exception):
+                        temp_path.unlink()
 
     def _verify_destinations_written(self) -> list[DestinationResult]:
         """
@@ -456,7 +634,7 @@ class CopyEngine:
         final_hash = ""
 
         for bytes_hashed, final_hash in HashCalculator.hash_file(
-            self.source, self.hash_algorithm
+            self.source, self.hash_algorithm, self._abort_event
         ):
             if final_hash:
                 result.source_hash_post = final_hash
@@ -503,7 +681,7 @@ class CopyEngine:
             last_bytes = 0
 
             for bytes_hashed, final_hash in HashCalculator.hash_file(
-                path, self.hash_algorithm
+                path, self.hash_algorithm, self._abort_event
             ):
                 if not final_hash:
                     # Progress update - report delta since last update
@@ -531,6 +709,14 @@ class CopyEngine:
             all_done = False
 
             while not all_done:
+                # Check for abort
+                if self._abort_event.is_set():
+                    # Cancel all running futures
+                    for future in future_to_path:
+                        future.cancel()
+                    # Exit immediately without completing verification
+                    return
+
                 # Check current progress
                 with progress_lock:
                     current_bytes = shared_progress["bytes_hashed"]
@@ -555,6 +741,9 @@ class CopyEngine:
                 try:
                     path_result, file_hash = future.result()
                     hashes[path_result] = file_hash
+                except InterruptedError:
+                    # Interrupted - just return without setting hashes
+                    return
                 except Exception as e:
                     # Mark this destination as failed
                     if path != self.source:
@@ -685,15 +874,106 @@ class CLIProcessor:
 
         return dest_paths
 
+    def _check_resume(
+        self, source: Path, destinations: list[Path]
+    ) -> tuple[bool, list[ResumeInfo]]:
+        """
+        Check for incomplete .tmp files and prompt user to resume.
+
+        Returns: (should_resume, resume_info_list)
+        """
+        resume_infos = []
+        source_stat = source.stat()
+
+        # Check each destination for .tmp file
+        for dest in destinations:
+            tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+            if tmp_path.exists():
+                try:
+                    tmp_stat = tmp_path.stat()
+                    tmp_size = tmp_stat.st_size
+                    source_size = source_stat.st_size
+
+                    # Validate .tmp file size
+                    if tmp_size > source_size:
+                        print(
+                            f"Warning: {tmp_path.name} is larger than source, will restart",
+                            file=sys.stderr,
+                        )
+                        tmp_path.unlink()
+                        continue
+
+                    # Check if source was modified after .tmp was created
+                    if source_stat.st_mtime > tmp_stat.st_mtime:
+                        print(
+                            f"Warning: Source file modified since {tmp_path.name} was created, will restart",
+                            file=sys.stderr,
+                        )
+                        tmp_path.unlink()
+                        continue
+
+                    if tmp_size > 0:
+                        progress = (
+                            (tmp_size / source_size * 100) if source_size > 0 else 0
+                        )
+                        resume_infos.append(
+                            ResumeInfo(
+                                dest_path=dest,
+                                tmp_path=tmp_path,
+                                bytes_written=tmp_size,
+                                progress_percent=progress,
+                            )
+                        )
+                except (OSError, FileNotFoundError) as e:
+                    print(f"Warning: Could not check {tmp_path}: {e}", file=sys.stderr)
+
+        # If no resumable files found, return False
+        if not resume_infos:
+            return False, []
+
+        # Show prompt
+        print("\nFound incomplete copy:")
+        for info in resume_infos:
+            mb_done = info.bytes_written / (1024 * 1024)
+            source_mb = source.stat().st_size / (1024 * 1024)
+            print(
+                f"  {info.tmp_path.name} ({mb_done:.1f}/{source_mb:.1f} MB - {info.progress_percent:.1f}%)"
+            )
+
+        # Interactive prompt with timeout
+        try:
+            response = input("Resume from where you left off? [y/n]: ").strip().lower()
+            should_resume = response in ["y", "yes"]
+        except (EOFError, KeyboardInterrupt):
+            print("\nDefaulting to NO (fresh start)")
+            should_resume = False
+
+        # If not resuming, clean up .tmp files
+        if not should_resume:
+            for info in resume_infos:
+                info.tmp_path.unlink()
+            return False, []
+
+        return True, resume_infos
+
     def _execute_single_copy(
         self, source: Path, destinations: list[Path]
     ) -> CopyResult:
         """Execute a single copy operation with simple text progress."""
+        # Check for resume opportunity
+        should_resume, resume_infos = self._check_resume(source, destinations)
+
+        # Create resume info dict for engine
+        resume_map = {}
+        if should_resume:
+            resume_map = {info.dest_path: info for info in resume_infos}
+
         engine = CopyEngine(
             source=source,
             destinations=destinations,
             verification_mode=self.verification_mode,
             hash_algorithm=self.hash_algorithm,
+            resume_info=resume_map,
         )
 
         result = None

@@ -30,6 +30,7 @@ from cvv import (
     DestinationResult,
     EventType,
     HashCalculator,
+    ResumeInfo,
     VerificationMode,
 )
 
@@ -576,6 +577,180 @@ class TestIntegration(unittest.TestCase):
                     data,
                     f"{dest_file} should have correct content",
                 )
+
+
+class TestResumeFunction(unittest.TestCase):
+    """Test cases for pause/resume functionality."""
+
+    def setUp(self) -> None:
+        """Set up test directory and source file."""
+        self.test_dir = tempfile.mkdtemp()
+        self.test_path = Path(self.test_dir)
+
+        # Create 16MB test file
+        self.source_file = self.test_path / "source.dat"
+        test_data = b"X" * (16 * 1024 * 1024)  # 16MB
+        self.source_file.write_bytes(test_data)
+
+    def tearDown(self) -> None:
+        """Clean up test directory."""
+        shutil.rmtree(self.test_dir)
+
+    def test_resume_parallel_same_position(self) -> None:
+        """Test resuming when all destinations at same position."""
+        dest1 = self.test_path / "dest1.dat"
+        dest2 = self.test_path / "dest2.dat"
+
+        # Create partial .tmp files (8MB each - halfway through 16MB source)
+        tmp1 = dest1.with_suffix(dest1.suffix + ".tmp")
+        tmp2 = dest2.with_suffix(dest2.suffix + ".tmp")
+
+        partial_data = b"X" * (8 * 1024 * 1024)  # 8MB
+        tmp1.write_bytes(partial_data)
+        tmp2.write_bytes(partial_data)
+
+        # Create resume info
+        resume_info = {
+            dest1: ResumeInfo(dest1, tmp1, 8 * 1024 * 1024, 50.0),
+            dest2: ResumeInfo(dest2, tmp2, 8 * 1024 * 1024, 50.0),
+        }
+
+        # Resume copy
+        engine = CopyEngine(
+            source=self.source_file,
+            destinations=[dest1, dest2],
+            verification_mode=VerificationMode.FULL,
+            resume_info=resume_info,
+        )
+
+        result = None
+        for event in engine.copy():
+            if isinstance(event, CopyResult):
+                result = event
+
+        # Verify success
+        self.assertTrue(result.success)
+        self.assertTrue(dest1.exists())
+        self.assertTrue(dest2.exists())
+        self.assertEqual(dest1.stat().st_size, 16 * 1024 * 1024)
+        self.assertEqual(dest2.stat().st_size, 16 * 1024 * 1024)
+
+        # Verify content matches source
+        self.assertEqual(dest1.read_bytes(), self.source_file.read_bytes())
+        self.assertEqual(dest2.read_bytes(), self.source_file.read_bytes())
+
+        # Verify .tmp files were cleaned up
+        self.assertFalse(tmp1.exists())
+        self.assertFalse(tmp2.exists())
+
+    def test_resume_sequential_different_positions(self) -> None:
+        """Test resuming when destinations at different positions."""
+        dest1 = self.test_path / "dest1.dat"
+        dest2 = self.test_path / "dest2.dat"
+
+        # Create partial .tmp files at different positions
+        tmp1 = dest1.with_suffix(dest1.suffix + ".tmp")
+        tmp2 = dest2.with_suffix(dest2.suffix + ".tmp")
+
+        tmp1.write_bytes(b"X" * (12 * 1024 * 1024))  # 12MB (75%)
+        tmp2.write_bytes(b"X" * (4 * 1024 * 1024))   # 4MB (25%)
+
+        # Create resume info
+        resume_info = {
+            dest1: ResumeInfo(dest1, tmp1, 12 * 1024 * 1024, 75.0),
+            dest2: ResumeInfo(dest2, tmp2, 4 * 1024 * 1024, 25.0),
+        }
+
+        # Resume copy
+        engine = CopyEngine(
+            source=self.source_file,
+            destinations=[dest1, dest2],
+            verification_mode=VerificationMode.FULL,
+            resume_info=resume_info,
+        )
+
+        result = None
+        for event in engine.copy():
+            if isinstance(event, CopyResult):
+                result = event
+
+        # Verify success
+        self.assertTrue(result.success)
+        self.assertTrue(dest1.exists())
+        self.assertTrue(dest2.exists())
+
+        # Verify content matches source
+        self.assertEqual(dest1.read_bytes(), self.source_file.read_bytes())
+        self.assertEqual(dest2.read_bytes(), self.source_file.read_bytes())
+
+    def test_hash_state_restoration(self) -> None:
+        """Test that hash state is correctly restored on resume."""
+        dest = self.test_path / "dest.dat"
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+
+        # Create partial .tmp file
+        partial_data = b"X" * (8 * 1024 * 1024)  # 8MB
+        tmp.write_bytes(partial_data)
+
+        # Resume with hashing
+        resume_info = {
+            dest: ResumeInfo(dest, tmp, 8 * 1024 * 1024, 50.0),
+        }
+
+        engine = CopyEngine(
+            source=self.source_file,
+            destinations=[dest],
+            verification_mode=VerificationMode.FULL,
+            resume_info=resume_info,
+        )
+
+        result = None
+        for event in engine.copy():
+            if isinstance(event, CopyResult):
+                result = event
+
+        # Verify hash was computed correctly (should match full file hash)
+        # Hash the full source file for comparison
+        full_hash = None
+        for _, hash_val in HashCalculator.hash_file(self.source_file, "xxh64be"):
+            if hash_val:
+                full_hash = hash_val
+                break
+
+        self.assertEqual(result.source_hash_inflight, full_hash)
+        self.assertEqual(result.source_hash_post, full_hash)
+        self.assertEqual(result.destinations[0].hash_post, full_hash)
+
+    def test_resume_with_source_file_changed(self) -> None:
+        """Test that resume detects when source file was modified."""
+        dest = self.test_path / "dest.dat"
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+
+        # Create partial .tmp file
+        tmp.write_bytes(b"X" * (8 * 1024 * 1024))
+
+        # Simulate source file being newer than .tmp
+        import time
+        time.sleep(0.1)
+        self.source_file.write_bytes(b"Y" * (16 * 1024 * 1024))
+
+        # Create CLI processor and check resume
+        with patch("builtins.input", return_value="y"):
+            cli = CLIProcessor(
+                source=self.source_file,
+                destinations=[dest],
+                verification_mode=VerificationMode.FULL,
+                hash_algorithm="xxh64be",
+            )
+
+            should_resume, resume_infos = cli._check_resume(self.source_file, [dest])
+
+            # Should NOT resume because source was modified
+            self.assertFalse(should_resume)
+            self.assertEqual(len(resume_infos), 0)
+
+            # .tmp file should be deleted
+            self.assertFalse(tmp.exists())
 
 
 if __name__ == "__main__":
