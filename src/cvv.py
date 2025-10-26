@@ -189,14 +189,11 @@ class CopyEngine:
         signal.signal(signal.SIGINT, self._handle_interrupt)
 
     def _handle_interrupt(self, signum, frame):
-        """Handle Ctrl+C gracefully - preserve .tmp files for resume."""
+        """Handle Ctrl+C gracefully."""
         if not self._interrupted:
             self._interrupted = True
             self._abort_event.set()
-            print(
-                "\n\nCopy interrupted. Re-run the same command to resume.",
-                file=sys.stderr,
-            )
+            print("\n\nCopy interrupted.", file=sys.stderr)
 
     def copy(self) -> Iterator[CopyEvent | CopyResult]:
         """
