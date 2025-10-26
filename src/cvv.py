@@ -148,7 +148,9 @@ class HashCalculator:
 
     @staticmethod
     def hash_file(
-        path: Path, algorithm: str = "xxh64be", abort_event: threading.Event | None = None
+        path: Path,
+        algorithm: str = "xxh64be",
+        abort_event: threading.Event | None = None,
     ) -> Iterator[tuple[int, str]]:
         """
         Hash a file and yield progress.
@@ -382,7 +384,7 @@ class CopyEngine:
             yield from self._stream_sequential(source_size, enable_hashing)
 
     def _stream_parallel(
-        self, source_size: int, enable_hashing: bool, resume_from: int
+        self, enable_hashing: bool, resume_from: int
     ) -> Iterator[int | str]:
         """
         Parallel fan-out streaming (all destinations at same position).
@@ -430,9 +432,17 @@ class CopyEngine:
 
                     bytes_read += len(chunk)
 
-                    # Distribute to all queues
+                    # Distribute to all queues (with timeout to allow interrupt)
                     for q in chunk_queues:
-                        q.put(chunk)
+                        while not self._abort_event.is_set():
+                            try:
+                                q.put(chunk, timeout=0.1)
+                                break  # Successfully queued
+                            except queue.Full:
+                                # Queue full, retry after checking abort
+                                continue
+                        if self._abort_event.is_set():
+                            break
 
                     # Throttle progress updates to reduce CPU usage
                     current_time = time.time()
@@ -445,16 +455,21 @@ class CopyEngine:
                         raise OSError(f"Writer errors: {writer_errors}")
 
         finally:
-            # Signal all writers to stop
+            # Signal all writers to stop (with timeout to avoid blocking)
             for q in chunk_queues:
-                q.put(None)
+                try:
+                    q.put(None, timeout=0.5)
+                except queue.Full:
+                    # Queue full - thread likely already exiting
+                    pass
 
-            # Wait for all writers to finish
+            # Wait for all writers to finish (with timeout if interrupted)
+            timeout_per_thread = 0.5 if self._abort_event.is_set() else None
             for t in writer_threads:
-                t.join()
+                t.join(timeout=timeout_per_thread)
 
-            # Check for any writer errors
-            if writer_errors:
+            # Check for any writer errors (only if not interrupted)
+            if writer_errors and not self._abort_event.is_set():
                 raise OSError(f"Writer thread errors: {writer_errors}")
 
         # Yield final progress to ensure 100% is shown
@@ -555,7 +570,15 @@ class CopyEngine:
         try:
             with open(temp_path, mode) as f:
                 while True:
-                    chunk = chunk_queue.get()
+                    # Get chunk with timeout to allow checking abort
+                    try:
+                        chunk = chunk_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        # Check if we should exit
+                        if self._abort_event.is_set():
+                            return
+                        continue  # Keep waiting for chunks
+
                     if chunk is None:  # Sentinel
                         break
                     if self._abort_event.is_set():
