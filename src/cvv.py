@@ -16,7 +16,6 @@ Architecture:
 import argparse
 import contextlib
 import hashlib
-import logging
 import queue
 import shutil
 import signal
@@ -1010,20 +1009,7 @@ Examples:
         help="Hash algorithm for verification (default: xxh64be)",
     )
 
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-
     args = parser.parse_args()
-
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s: %(message)s",
-    )
 
     # Run the CLI processor
     try:
@@ -1042,10 +1028,6 @@ Examples:
         return 130
     except Exception as e:
         print(f"Error: {e}")
-        if args.verbose:
-            import traceback
-
-            traceback.print_exc()
         return 1
 
 

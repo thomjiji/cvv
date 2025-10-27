@@ -28,15 +28,21 @@ cvv /source/folder /backup1/folder /backup2/folder
 
 ## Options
 
-- `-v` - Show verification mode (transfer/source/full)
-- `-a` - Hash algorithm (xxh64be, md5, sha256)
+- `-m, --mode` - Verification mode: `transfer` (size only), `source` (verify source), `full` (verify all) (default: full)
+- `--hash-algorithm` - Hash algorithm: `xxh64be`, `md5`, `sha1`, `sha256` (default: xxh64be)
 
 ## Examples
 
-Copy with full verification:
+Copy with transfer mode (fastest, size check only):
 
 ```bash
-cvv -v full -a xxh64be video.mov /backup1/video.mov /backup2/video.mov
+cvv -m transfer video.mov /backup1/video.mov /backup2/video.mov
+```
+
+Copy with full verification and SHA256:
+
+```bash
+cvv -m full --hash-algorithm sha256 video.mov /backup1/video.mov /backup2/video.mov
 ```
 
 Copy a directory:
