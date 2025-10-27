@@ -187,7 +187,9 @@ class CopyEngine:
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
         # Use provided abort event, or fall back to shared one
-        self._abort_event = abort_event if abort_event else CopyEngine._shared_abort_event
+        self._abort_event = (
+            abort_event if abort_event else CopyEngine._shared_abort_event
+        )
         self._interrupted = False
 
         # Install signal handler once (not per instance) - only for shared event
@@ -326,9 +328,7 @@ class CopyEngine:
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-    def _stream_to_destinations(
-        self, source_size: int, enable_hashing: bool
-    ) -> Iterator[int | str]:
+    def _stream_to_destinations(self, enable_hashing: bool) -> Iterator[int | str]:
         """
         Read source once, fan out to multiple writers.
 
@@ -356,7 +356,6 @@ class CopyEngine:
 
         try:
             with open(self.source, "rb") as f:
-
                 while not self._abort_event.is_set():
                     chunk = f.read(BUFFER_SIZE)
                     if not chunk:
@@ -824,9 +823,7 @@ class CLIProcessor:
             )
             # Create success results for all destinations
             for dest in destinations:
-                result.destinations.append(
-                    DestinationResult(path=dest, success=True)
-                )
+                result.destinations.append(DestinationResult(path=dest, success=True))
             return result
 
         engine = CopyEngine(
