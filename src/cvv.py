@@ -171,28 +171,41 @@ class CopyEngine:
     This is completely UI-agnostic - it yields events and never touches stdout.
     """
 
+    # Class-level shared abort event (persists across all instances)
+    _shared_abort_event = threading.Event()
+    _signal_handler_installed = False
+
     def __init__(
         self,
         source: Path,
         destinations: list[Path],
         verification_mode: VerificationMode = VerificationMode.FULL,
         hash_algorithm: str = "xxh64be",
+        abort_event: threading.Event | None = None,
     ):
         self.source = source
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
-        self._abort_event = threading.Event()
+        # Use provided abort event, or fall back to shared one
+        self._abort_event = abort_event if abort_event else CopyEngine._shared_abort_event
         self._interrupted = False
 
-        # Install signal handler for graceful Ctrl+C
-        signal.signal(signal.SIGINT, self._handle_interrupt)
+        # Install signal handler once (not per instance) - only for shared event
+        if abort_event is None and not CopyEngine._signal_handler_installed:
+            signal.signal(signal.SIGINT, self._handle_interrupt)
+            CopyEngine._signal_handler_installed = True
+
+    @classmethod
+    def reset_shared_state(cls) -> None:
+        """Reset the shared abort event (useful for testing)."""
+        cls._shared_abort_event.clear()
 
     def _handle_interrupt(self, signum, frame):
-        """Handle Ctrl+C gracefully."""
-        if not self._interrupted:
+        """Handle Ctrl+C gracefully - stops all current and future operations."""
+        if not CopyEngine._shared_abort_event.is_set():
+            CopyEngine._shared_abort_event.set()
             self._interrupted = True
-            self._abort_event.set()
             print("\n\nCopy interrupted.", file=sys.stderr)
 
     def copy(self) -> Iterator[CopyEvent | CopyResult]:
@@ -702,6 +715,10 @@ class CLIProcessor:
         # Execute each copy job
         results = []
         for i, source_file in enumerate(source_files, 1):
+            # Check if user pressed Ctrl+C (before starting next file)
+            if CopyEngine._shared_abort_event.is_set():
+                break
+
             print(f"\nFile {i}/{len(source_files)}: {source_file.name}")
 
             dest_paths = self._calculate_destinations(source_file)

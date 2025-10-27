@@ -38,6 +38,7 @@ class TestHashCalculator(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
@@ -103,6 +104,7 @@ class TestCopyEngine(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory and files."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
@@ -221,6 +223,7 @@ class TestVerificationModes(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory and files."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
@@ -343,6 +346,7 @@ class TestErrorHandling(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
@@ -419,6 +423,7 @@ class TestCLIProcessor(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory and files."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
@@ -524,6 +529,7 @@ class TestIntegration(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up test directory."""
+        CopyEngine.reset_shared_state()
         self.test_dir = tempfile.mkdtemp()
         self.test_path = Path(self.test_dir)
 
