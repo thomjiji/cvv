@@ -9,8 +9,9 @@ tool without requiring users to specify the full path to the Python module.
 import sys
 from pathlib import Path
 
-# Add src directory to Python path
-src_dir = Path(__file__).parent / "src"
+# Add src directory to Python path (go up to project root first)
+project_root = Path(__file__).parent.parent
+src_dir = project_root / "src"
 sys.path.insert(0, str(src_dir))
 
 # Import and run the main function
