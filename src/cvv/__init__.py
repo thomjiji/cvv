@@ -6,7 +6,7 @@ Offload Manager, providing reliable file transfer with integrity verification,
 progress monitoring, and multi-destination support.
 """
 
-from .cvv import (
+from .main import (
     CLIProcessor,
     CopyEngine,
     CopyEvent,
