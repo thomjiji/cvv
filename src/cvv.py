@@ -245,9 +245,7 @@ class CopyEngine:
             # We just won't do post-copy verification in TRANSFER mode
             enable_hashing = True
 
-            for event_or_hash in self._stream_to_destinations(
-                source_size, enable_hashing
-            ):
+            for event_or_hash in self._stream_to_destinations(enable_hashing):
                 if isinstance(event_or_hash, str):
                     # Final hash result
                     result.source_hash_inflight = event_or_hash
