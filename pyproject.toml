@@ -1,23 +1,18 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "cvv"
-version = "1.0.0"
-description = "Professional file copying tools for DIT workflows"
-requires-python = ">=3.8"
-dependencies = ["xxhash>=3.0.0"]
+version = "0.0.1"
+description = "File copy tool with one read, multiple writes. Copying in parallel, simultaneously."
+readme = "README.md"
+authors = [{ name = "thomjiji", email = "hxy449999@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["xxhash>=3.6.0"]
 
 [project.scripts]
 cvv = "cvv:main"
 
-[tool.setuptools]
-package-dir = { "" = "src" }
+[build-system]
+requires = ["uv_build>=0.8.11,<0.9.0"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.basedpyright]
-typeCheckingMode = "basic"
-reportUnusedCallResult = false
+[dependency-groups]
+dev = ["pytest>=8.4.2", "ruff>=0.14.2"]
