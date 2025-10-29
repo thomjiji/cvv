@@ -968,9 +968,9 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  cvv source.mp4 /dest1 /dest2              # Copy to 2 destinations with full verification
-  cvv source.mp4 /dest1 -m transfer         # Fast copy with size check only
-  cvv /source_dir /dest_dir -m full         # Copy entire directory with verification
+  cvv -m transfer /source /dest1 /dest2         # Fast copy with size check only
+  cvv -m full /source_dir /dest_dir             # Copy entire directory with full integrity verification
+  cvv source.mp4 /dest1 /dest2                  # Copy single file is also ok, default use full verification mode
         """,
     )
 

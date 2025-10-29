@@ -19,7 +19,7 @@ from .main import (
 )
 
 __version__ = "1.0.0"
-__author__ = "cvv project"
+__author__ = "thomjiji"
 __description__ = "Professional file copying tools for DIT workflows"
 
 __all__ = [
