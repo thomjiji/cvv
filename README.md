@@ -4,9 +4,11 @@ This project is highly experimental, don't use it in production enviroment.
 
 Copy files to multiple destinations simultaneously with (optionally) integrity verification.
 
+The name **“cvv”** comes from the simplest copy shortcut — **Ctrl-C / Cmd-C** and **Ctrl-V / Cmd-V**. But why **two V’s**? The idea is to highlight **“one read, multiple writes”** — in other words, a single **Ctrl-C** that can perform **multiple Ctrl-V’s simultaneously**.
+
 ## What it does
 
-cvv copies files or directories to multiple destinations simultaneously and verifies the copies are correct using hash checksums.
+cvv copies files or directories to multiple destinations simultaneously and verifies the copies are correct using checksums.
 
 ## Prerequisites
 
