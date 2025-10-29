@@ -10,21 +10,7 @@ cvv copies files or directories to multiple destinations simultaneously and veri
 
 ## Prerequisites
 
-This project is managed with **uv**. You need to have uv installed before proceeding.
-
-Install uv:
-```bash
-# On macOS and Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# On Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Or using pip
-pip install uv
-```
-
-For more installation options, see: https://docs.astral.sh/uv/getting-started/installation/
+This project is managed with **uv**. You need to have [uv installed](https://docs.astral.sh/uv/getting-started/installation/) before proceeding.
 
 ## Installation
 
@@ -82,10 +68,10 @@ Copy with transfer mode (fastest, size check only):
 cvv -m transfer video.mov /backup1/video.mov /backup2/video.mov
 ```
 
-Copy with full verification and SHA256:
+Copy with full verification using xxh64be:
 
 ```bash
-cvv -m full --hash-algorithm sha256 video.mov /backup1/video.mov /backup2/video.mov
+cvv -m full --hash-algorithm xxh64be video.mov /backup1/video.mov /backup2/video.mov
 ```
 
 Copy a directory:
