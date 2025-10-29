@@ -1,3 +1,4 @@
+1. show realtime copy speed
 1. progress bar, lib: rich, tqdm
-2. produce a log file per run
-3. produce a mhl file, ascmhl
+1. produce a log file per run
+1. produce a mhl file, ascmhl
