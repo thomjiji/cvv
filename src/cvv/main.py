@@ -783,7 +783,7 @@ class CLIProcessor:
                     continue
                 else:
                     print(
-                        f"  ⚠ {dest.name} exists but wrong size "
+                        f"  ! {dest.name} exists but wrong size "
                         f"({dest_size} vs {source_size}), will overwrite"
                     )
                     dest.unlink()
@@ -795,7 +795,7 @@ class CLIProcessor:
                 mb_done = tmp_size / (1024 * 1024)
                 source_mb = source_size / (1024 * 1024)
                 print(
-                    f"  ⚠ Found incomplete {tmp_path.name} "
+                    f"  ! Found incomplete {tmp_path.name} "
                     f"({mb_done:.1f}/{source_mb:.1f} MB), restarting from beginning"
                 )
                 tmp_path.unlink()
