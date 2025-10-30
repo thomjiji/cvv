@@ -4,7 +4,7 @@ This project is highly experimental, don't use it in production enviroment.
 
 Copy files to multiple destinations simultaneously with (optionally) integrity verification.
 
-The name “cvv” comes from the simplest copy shortcut — Ctrl-C / Cmd-C and Ctrl-V / Cmd-V. We call it copy using "cv", or just "cv" it. But why two V’s? The idea is to highlight “one read, multiple writes” — in other words, a single Ctrl-C that can perform multiple Ctrl-V’s simultaneously.
+The name “cvv” comes from the simplest copy shortcut — Ctrl-C / Cmd-C and Ctrl-V / Cmd-V. We call it copy using "cv", or just "cv" it. But why two V’s? The idea is to highlight “one read, multiple writes” nature of it — A single Ctrl-C that can perform multiple Ctrl-V’s simultaneously.
 
 ## What it does
 
