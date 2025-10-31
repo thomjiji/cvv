@@ -14,19 +14,22 @@ Architecture:
 """
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
-import queue
 import shutil
 import signal
 import sys
 import threading
 import time
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import BinaryIO
+
+import aiofiles
+import aiofiles.os
 
 try:
     import xxhash
@@ -37,7 +40,6 @@ except ImportError:
 
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
-QUEUE_SIZE = 10  # Max chunks buffered per destination
 
 
 # ============================================================================
@@ -246,13 +248,57 @@ class HashCalculator:
         return self._hasher.hexdigest()
 
     @staticmethod
+    async def hash_file_async(
+        path: Path,
+        algorithm: str = "xxh64be",
+        abort_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[tuple[int, str]]:
+        """
+        Hash a file asynchronously and yield progress.
+
+        Parameters
+        ----------
+        path : Path
+            Path to file to hash
+        algorithm : str, default="xxh64be"
+            Hash algorithm to use
+        abort_event : asyncio.Event | None, default=None
+            Event to check for abort signal
+
+        Yields
+        ------
+        tuple[int, str]
+            (bytes_hashed, final_hash_or_empty_string)
+            Progress updates yield empty string, final yield contains complete hash
+
+        Raises
+        ------
+        InterruptedError
+            If abort_event is set during hashing
+        """
+        hasher = HashCalculator(algorithm)
+        total_bytes = 0
+
+        async with aiofiles.open(path, "rb") as f:
+            while chunk := await f.read(BUFFER_SIZE):
+                # Check for abort
+                if abort_event and abort_event.is_set():
+                    raise InterruptedError("Hash operation interrupted")
+                hasher.update(chunk)
+                total_bytes += len(chunk)
+                yield (total_bytes, "")
+
+        # Final yield with complete hash
+        yield (total_bytes, hasher.hexdigest())
+
+    @staticmethod
     def hash_file(
         path: Path,
         algorithm: str = "xxh64be",
         abort_event: threading.Event | None = None,
     ) -> Iterator[tuple[int, str]]:
         """
-        Hash a file and yield progress.
+        Hash a file and yield progress (sync version for backward compatibility).
 
         Parameters
         ----------
@@ -364,7 +410,7 @@ class CopyEngine:
             self._interrupted = True
             print("\n\nCopy interrupted.", file=sys.stderr)
 
-    def copy(self) -> Iterator[CopyEvent | CopyResult]:
+    async def copy(self) -> AsyncIterator[CopyEvent | CopyResult]:
         """
         Execute the copy operation.
 
@@ -403,7 +449,7 @@ class CopyEngine:
             # We just won't do post-copy verification in TRANSFER mode
             enable_hashing = True
 
-            for event_or_hash in self._stream_to_destinations(enable_hashing):
+            async for event_or_hash in self._stream_to_destinations(enable_hashing):
                 if isinstance(event_or_hash, str):
                     # Final hash result
                     result.source_hash_inflight = event_or_hash
@@ -432,9 +478,11 @@ class CopyEngine:
                 # Already verified sizes during _verify_destinations_written
                 pass
             elif self.verification_mode == VerificationMode.SOURCE:
-                yield from self._verify_source_only(result)
+                async for event in self._verify_source_only(result):
+                    yield event
             elif self.verification_mode == VerificationMode.FULL:
-                yield from self._verify_full(result)
+                async for event in self._verify_full(result):
+                    yield event
 
         except InterruptedError:
             # User pressed Ctrl+C - exit gracefully
@@ -517,9 +565,9 @@ class CopyEngine:
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-    def _stream_to_destinations(self, enable_hashing: bool) -> Iterator[int | str]:
+    async def _stream_to_destinations(self, enable_hashing: bool) -> AsyncIterator[int | str]:
         """
-        Read source once, fan out to multiple writers.
+        Read source once, write to multiple destinations concurrently.
 
         Parameters
         ----------
@@ -534,34 +582,32 @@ class CopyEngine:
         Raises
         ------
         OSError
-            If writer threads encounter errors
+            If write operations encounter errors
         InterruptedError
             If operation is aborted
         """
-        # Create queues and writer threads
-        chunk_queues = [queue.Queue(maxsize=QUEUE_SIZE) for _ in self.destinations]
-        writer_threads = []
-        writer_errors = {}
-
-        for i, dest_path in enumerate(self.destinations):
-            thread = threading.Thread(
-                target=self._writer_thread,
-                args=(dest_path, chunk_queues[i], writer_errors),
-                daemon=True,
-            )
-            thread.start()
-            writer_threads.append(thread)
-
-        # Create hasher if needed
-        hasher = HashCalculator(self.hash_algorithm) if enable_hashing else None
-        bytes_read = 0
-        last_progress_time = time.time()
-        progress_interval = 0.1  # Throttle progress to max 10 updates/second
+        # Open all destination files asynchronously
+        dest_files = []
+        temp_paths = []
 
         try:
-            with open(self.source, "rb") as f:
+            for dest_path in self.destinations:
+                temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+                # Open file with explicit large buffer for better performance
+                dest_file = await aiofiles.open(temp_path, 'wb', buffering=BUFFER_SIZE)
+                dest_files.append(dest_file)
+                temp_paths.append((dest_path, temp_path))
+
+            # Create hasher if needed
+            hasher = HashCalculator(self.hash_algorithm) if enable_hashing else None
+            bytes_read = 0
+            last_progress_time = time.time()
+            progress_interval = 0.1  # Throttle progress to max 10 updates/second
+
+            # Read source and write to all destinations concurrently
+            async with aiofiles.open(self.source, 'rb') as f_source:
                 while not self._abort_event.is_set():
-                    chunk = f.read(BUFFER_SIZE)
+                    chunk = await f_source.read(BUFFER_SIZE)
                     if not chunk:
                         break
 
@@ -570,17 +616,15 @@ class CopyEngine:
 
                     bytes_read += len(chunk)
 
-                    # Distribute to all queues (with timeout to allow interrupt)
-                    for q in chunk_queues:
-                        while not self._abort_event.is_set():
-                            try:
-                                q.put(chunk, timeout=0.1)
-                                break  # Successfully queued
-                            except queue.Full:
-                                # Queue full, retry after checking abort
-                                continue
-                        if self._abort_event.is_set():
-                            break
+                    # Write to ALL destinations concurrently (no queue bottleneck!)
+                    if not self._abort_event.is_set():
+                        try:
+                            await asyncio.gather(*[
+                                dest_file.write(chunk)
+                                for dest_file in dest_files
+                            ])
+                        except Exception as e:
+                            raise OSError(f"Write error: {e}")
 
                     # Throttle progress updates to reduce CPU usage
                     current_time = time.time()
@@ -588,96 +632,36 @@ class CopyEngine:
                         yield bytes_read
                         last_progress_time = current_time
 
-                    # Check for writer errors
-                    if writer_errors:
-                        raise OSError(f"Writer errors: {writer_errors}")
+            # Yield final progress to ensure 100% is shown
+            if bytes_read > 0:
+                yield bytes_read
+
+            # Return final hash if enabled
+            if hasher:
+                yield hasher.hexdigest()
 
         finally:
-            # Signal all writers to stop (with timeout to avoid blocking)
-            for q in chunk_queues:
+            # Close all destination files
+            for dest_file in dest_files:
                 try:
-                    q.put(None, timeout=0.5)
-                except queue.Full:
-                    # Queue full - thread likely already exiting
+                    await dest_file.close()
+                except Exception:
                     pass
 
-            # Wait for all writers to finish (with timeout if interrupted)
-            timeout_per_thread = 0.5 if self._abort_event.is_set() else None
-            for t in writer_threads:
-                t.join(timeout=timeout_per_thread)
-
-            # Check for any writer errors (only if not interrupted)
-            if writer_errors and not self._abort_event.is_set():
-                raise OSError(f"Writer thread errors: {writer_errors}")
-
-        # Yield final progress to ensure 100% is shown
-        if bytes_read > 0:
-            yield bytes_read
-
-        # Return final hash if enabled
-        if hasher:
-            yield hasher.hexdigest()
-
-    def _writer_thread(
-        self,
-        dest_path: Path,
-        chunk_queue: queue.Queue,
-        error_dict: dict,
-    ) -> None:
-        """
-        Writer thread: receives chunks and writes to temp file.
-
-        On success, atomically renames temp to final destination.
-
-        Parameters
-        ----------
-        dest_path : Path
-            Final destination file path
-        chunk_queue : queue.Queue
-            Queue from which to receive data chunks
-        error_dict : dict
-            Shared dictionary for reporting errors
-
-        Notes
-        -----
-        Writes to a .tmp file first, then atomically renames on success.
-        On Ctrl+C, preserves .tmp file for potential resume on next run.
-        """
-        temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
-        mode = "wb"  # Always start fresh (no resume from exact position)
-
-        try:
-            with open(temp_path, mode) as f:
-                while True:
-                    # Get chunk with timeout to allow checking abort
-                    try:
-                        chunk = chunk_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        # Check if we should exit
-                        if self._abort_event.is_set():
-                            return
-                        continue  # Keep waiting for chunks
-
-                    if chunk is None:  # Sentinel
-                        break
-                    if self._abort_event.is_set():
-                        return
-                    f.write(chunk)
-
-            # Atomic rename on success
+            # Atomic rename on success (only if not aborted)
             if not self._abort_event.is_set():
-                temp_path.replace(dest_path)
-
-        except Exception as e:
-            error_dict[dest_path] = str(e)
-            self._abort_event.set()
-        finally:
-            # Clean up temp file if interrupted (keep .tmp on Ctrl+C for resume)
-            if self._abort_event.is_set() and not self._interrupted:
-                # Only delete on real error, not on Ctrl+C
-                if temp_path.exists():
-                    with contextlib.suppress(Exception):
-                        temp_path.unlink()
+                for dest_path, temp_path in temp_paths:
+                    try:
+                        temp_path.replace(dest_path)
+                    except Exception as e:
+                        raise OSError(f"Failed to rename {temp_path} to {dest_path}: {e}")
+            else:
+                # On abort, clean up temp files if not interrupted by Ctrl+C
+                if not self._interrupted:
+                    for _, temp_path in temp_paths:
+                        if temp_path.exists():
+                            with contextlib.suppress(Exception):
+                                temp_path.unlink()
 
     def _verify_destinations_written(self) -> list[DestinationResult]:
         """
@@ -725,7 +709,7 @@ class CopyEngine:
 
         return results
 
-    def _verify_source_only(self, result: CopyResult) -> Iterator[CopyEvent]:
+    async def _verify_source_only(self, result: CopyResult) -> AsyncIterator[CopyEvent]:
         """
         SOURCE mode: Re-hash source file to ensure it didn't change during copy.
 
@@ -748,9 +732,15 @@ class CopyEngine:
         bytes_hashed = 0
         final_hash = ""
 
-        for bytes_hashed, final_hash in HashCalculator.hash_file(
-            self.source, self.hash_algorithm, self._abort_event
+        # Note: We still use threading.Event for abort_event (signal handling)
+        # but check it in async context - this is fine
+        async for bytes_hashed, final_hash in HashCalculator.hash_file_async(
+            self.source, self.hash_algorithm, None  # Don't pass threading.Event to async
         ):
+            # Check for abort manually
+            if self._abort_event.is_set():
+                break
+
             if final_hash:
                 result.source_hash_post = final_hash
             else:
@@ -773,7 +763,7 @@ class CopyEngine:
             message="Source verification complete",
         )
 
-    def _verify_full(self, result: CopyResult) -> Iterator[CopyEvent]:
+    async def _verify_full(self, result: CopyResult) -> AsyncIterator[CopyEvent]:
         """
         FULL mode: Hash source and all destinations in parallel with real-time progress.
 
@@ -796,11 +786,11 @@ class CopyEngine:
             message=f"Verifying source + {len(self.destinations)} destination(s)",
         )
 
-        # Shared progress counter (thread-safe) tracks bytes hashed across all threads
-        progress_lock = threading.Lock()
+        # Shared progress counter (thread-safe for asyncio tasks)
         shared_progress = {"bytes_hashed": 0}
+        progress_lock = asyncio.Lock()
 
-        def hash_file_with_progress(path: Path) -> tuple[Path, str]:
+        async def hash_file_with_progress(path: Path) -> tuple[Path, str]:
             """
             Hash a file and update shared progress counter in real-time.
 
@@ -817,77 +807,72 @@ class CopyEngine:
             final_hash = ""
             last_bytes = 0
 
-            for bytes_hashed, final_hash in HashCalculator.hash_file(
-                path, self.hash_algorithm, self._abort_event
+            async for bytes_hashed, final_hash in HashCalculator.hash_file_async(
+                path, self.hash_algorithm, None
             ):
+                if self._abort_event.is_set():
+                    break
+
                 if not final_hash:
                     # Progress update - report delta since last update
                     delta = bytes_hashed - last_bytes
                     last_bytes = bytes_hashed
 
-                    with progress_lock:
+                    async with progress_lock:
                         shared_progress["bytes_hashed"] += delta
 
             # Return final hash
             return (path, final_hash)
 
-        # Hash all files in parallel
+        # Hash all files in parallel using asyncio.gather
         hashes = {}
 
-        with ThreadPoolExecutor(max_workers=len(files_to_hash)) as executor:
-            # Submit all hash jobs
-            future_to_path = {
-                executor.submit(hash_file_with_progress, path): path
-                for path in files_to_hash
-            }
+        try:
+            # Create tasks for all files
+            tasks = [hash_file_with_progress(path) for path in files_to_hash]
 
-            # Poll shared progress and yield events
-            last_reported = 0
-            all_done = False
+            # Create a task to monitor progress while hashing happens
+            async def monitor_progress():
+                last_reported = 0
+                while True:
+                    async with progress_lock:
+                        current_bytes = shared_progress["bytes_hashed"]
 
-            while not all_done:
-                # Check for abort
-                if self._abort_event.is_set():
-                    # Cancel all running futures
-                    for future in future_to_path:
-                        future.cancel()
-                    # Exit immediately without completing verification
-                    return
+                    if current_bytes > last_reported:
+                        yield CopyEvent(
+                            type=EventType.VERIFY_PROGRESS,
+                            bytes_processed=current_bytes,
+                            total_bytes=total_bytes,
+                        )
+                        last_reported = current_bytes
 
-                # Check current progress
-                with progress_lock:
-                    current_bytes = shared_progress["bytes_hashed"]
+                    await asyncio.sleep(0.1)  # Check every 100ms
 
-                # Yield progress if changed
-                if current_bytes > last_reported:
-                    yield CopyEvent(
-                        type=EventType.VERIFY_PROGRESS,
-                        bytes_processed=current_bytes,
-                        total_bytes=total_bytes,
-                    )
-                    last_reported = current_bytes
+            # Run hashing and progress monitoring concurrently
+            monitor_task = asyncio.create_task(monitor_progress().__anext__())
 
-                # Check if all futures are done
-                all_done = all(f.done() for f in future_to_path)
+            # Wait for all hashing to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                if not all_done:
-                    time.sleep(0.1)  # Poll every 100ms (reduces CPU usage)
+            # Cancel monitoring
+            monitor_task.cancel()
 
-            # Collect results
-            for future, path in future_to_path.items():
-                try:
-                    path_result, file_hash = future.result()
-                    hashes[path_result] = file_hash
-                except InterruptedError:
-                    # Interrupted - just return without setting hashes
-                    return
-                except Exception as e:
+            # Process results
+            for path, result_or_exc in zip(files_to_hash, results):
+                if isinstance(result_or_exc, Exception):
                     # Mark this destination as failed
                     if path != self.source:
                         for dest_result in result.destinations:
                             if dest_result.path == path:
                                 dest_result.success = False
-                                dest_result.error = f"Hash failed: {e}"
+                                dest_result.error = f"Hash failed: {result_or_exc}"
+                elif isinstance(result_or_exc, tuple):
+                    path_result, file_hash = result_or_exc
+                    hashes[path_result] = file_hash
+
+        except asyncio.CancelledError:
+            # Interrupted - just return without setting hashes
+            return
 
         # Store hashes in result
         result.source_hash_post = hashes.get(self.source)
@@ -973,7 +958,7 @@ class CLIProcessor:
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
 
-    def run(self) -> bool:
+    async def run(self) -> bool:
         """
         Execute copy jobs for all source files.
 
@@ -999,7 +984,7 @@ class CLIProcessor:
             print(f"\nFile {i}/{len(source_files)}: {source_file.name}")
 
             dest_paths = self._calculate_destinations(source_file)
-            result = self._execute_single_copy(source_file, dest_paths)
+            result = await self._execute_single_copy(source_file, dest_paths)
             results.append(result)
 
             # Show result summary
@@ -1121,7 +1106,7 @@ class CLIProcessor:
 
         return destinations_to_copy
 
-    def _execute_single_copy(
+    async def _execute_single_copy(
         self, source: Path, destinations: list[Path]
     ) -> CopyResult:
         """
@@ -1166,7 +1151,7 @@ class CLIProcessor:
         copy_total = 0
         verify_total = 0
 
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
                 sys.stdout.write("\n")  # Newline after progress
@@ -1367,7 +1352,7 @@ Examples:
             hash_algorithm=args.hash_algorithm,
         )
 
-        success = processor.run()
+        success = asyncio.run(processor.run())
         return 0 if success else 1
 
     except KeyboardInterrupt:

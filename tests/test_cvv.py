@@ -11,6 +11,7 @@ Tests cover:
 - Directory copying
 """
 
+import asyncio
 import hashlib
 import shutil
 import sys
@@ -18,6 +19,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
 
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -117,7 +120,8 @@ class TestCopyEngine(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_single_destination_copy(self) -> None:
+    @pytest.mark.asyncio
+    async def test_single_destination_copy(self) -> None:
         """Test copying to a single destination."""
         dest = self.test_path / "dest1.txt"
 
@@ -129,7 +133,7 @@ class TestCopyEngine(unittest.TestCase):
 
         # Consume generator and get result
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
                 break
@@ -141,7 +145,8 @@ class TestCopyEngine(unittest.TestCase):
         self.assertEqual(len(result.destinations), 1)
         self.assertTrue(result.destinations[0].success)
 
-    def test_multi_destination_copy(self) -> None:
+    @pytest.mark.asyncio
+    async def test_multi_destination_copy(self) -> None:
         """Test copying to multiple destinations simultaneously."""
         dest1 = self.test_path / "dest1.txt"
         dest2 = self.test_path / "dest2.txt"
@@ -155,7 +160,7 @@ class TestCopyEngine(unittest.TestCase):
 
         # Consume generator
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
@@ -167,7 +172,8 @@ class TestCopyEngine(unittest.TestCase):
             self.assertTrue(dest.exists())
             self.assertEqual(dest.read_bytes(), self.test_data)
 
-    def test_copy_events_emitted(self) -> None:
+    @pytest.mark.asyncio
+    async def test_copy_events_emitted(self) -> None:
         """Test that proper events are emitted during copy."""
         dest = self.test_path / "dest.txt"
 
@@ -180,7 +186,7 @@ class TestCopyEngine(unittest.TestCase):
         events = []
         result = None
 
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
             elif isinstance(event, CopyEvent):
@@ -192,7 +198,8 @@ class TestCopyEngine(unittest.TestCase):
         self.assertIn(EventType.COPY_COMPLETE, events)
         self.assertIsNotNone(result)
 
-    def test_source_not_found(self) -> None:
+    @pytest.mark.asyncio
+    async def test_source_not_found(self) -> None:
         """Test error handling when source file doesn't exist."""
         nonexistent = self.test_path / "nonexistent.txt"
         dest = self.test_path / "dest.txt"
@@ -203,7 +210,7 @@ class TestCopyEngine(unittest.TestCase):
         )
 
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
@@ -236,7 +243,8 @@ class TestVerificationModes(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_transfer_mode_hashing(self) -> None:
+    @pytest.mark.asyncio
+    async def test_transfer_mode_hashing(self) -> None:
         """Test TRANSFER mode - hashes in-flight but no post-copy verification."""
         dest = self.test_path / "dest.txt"
 
@@ -247,7 +255,7 @@ class TestVerificationModes(unittest.TestCase):
         )
 
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
@@ -257,7 +265,8 @@ class TestVerificationModes(unittest.TestCase):
         # But doesn't do post-copy verification
         self.assertIsNone(result.source_hash_post)
 
-    def test_source_mode_hashing(self) -> None:
+    @pytest.mark.asyncio
+    async def test_source_mode_hashing(self) -> None:
         """Test SOURCE mode - hash source in-flight and post-copy."""
         dest = self.test_path / "dest.txt"
 
@@ -270,7 +279,7 @@ class TestVerificationModes(unittest.TestCase):
         result = None
         events = []
 
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
             elif isinstance(event, CopyEvent):
@@ -285,7 +294,8 @@ class TestVerificationModes(unittest.TestCase):
         self.assertIn(EventType.VERIFY_START, events)
         self.assertIn(EventType.VERIFY_COMPLETE, events)
 
-    def test_full_mode_hashing(self) -> None:
+    @pytest.mark.asyncio
+    async def test_full_mode_hashing(self) -> None:
         """Test FULL mode - hash source and all destinations."""
         dest1 = self.test_path / "dest1.txt"
         dest2 = self.test_path / "dest2.txt"
@@ -297,7 +307,7 @@ class TestVerificationModes(unittest.TestCase):
         )
 
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
@@ -310,7 +320,8 @@ class TestVerificationModes(unittest.TestCase):
             self.assertIsNotNone(dest_result.hash_post)
             self.assertEqual(dest_result.hash_post, result.source_hash_inflight)
 
-    def test_full_mode_detects_corruption(self) -> None:
+    @pytest.mark.asyncio
+    async def test_full_mode_detects_corruption(self) -> None:
         """Test that FULL mode detects file corruption."""
         dest = self.test_path / "dest.txt"
 
@@ -331,7 +342,7 @@ class TestVerificationModes(unittest.TestCase):
             )
 
             result = None
-            for event in engine.copy():
+            async for event in engine.copy():
                 if isinstance(event, CopyResult):
                     result = event
 
@@ -357,7 +368,8 @@ class TestErrorHandling(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_insufficient_disk_space(self) -> None:
+    @pytest.mark.asyncio
+    async def test_insufficient_disk_space(self) -> None:
         """Test error when insufficient disk space."""
         dest = self.test_path / "dest.txt"
 
@@ -371,14 +383,15 @@ class TestErrorHandling(unittest.TestCase):
             mock_usage.return_value = Mock(free=0)
 
             result = None
-            for event in engine.copy():
+            async for event in engine.copy():
                 if isinstance(event, CopyResult):
                     result = event
 
             self.assertFalse(result.success)
             self.assertIn("space", result.destinations[0].error.lower())
 
-    def test_write_permission_error(self) -> None:
+    @pytest.mark.asyncio
+    async def test_write_permission_error(self) -> None:
         """Test error when destination is not writable."""
         # Use /dev/full which always returns "disk full" error
         if not Path("/dev/full").exists():
@@ -392,13 +405,14 @@ class TestErrorHandling(unittest.TestCase):
         )
 
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
         self.assertFalse(result.success)
 
-    def test_per_destination_errors(self) -> None:
+    @pytest.mark.asyncio
+    async def test_per_destination_errors(self) -> None:
         """Test that errors are tracked per destination."""
         dest1 = self.test_path / "dest1.txt"  # Good destination
         dest2 = Path("/nonexistent/path/dest2.txt")  # Bad destination
@@ -409,7 +423,7 @@ class TestErrorHandling(unittest.TestCase):
         )
 
         result = None
-        for event in engine.copy():
+        async for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
 
@@ -448,7 +462,8 @@ class TestCLIProcessor(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_single_file_copy(self) -> None:
+    @pytest.mark.asyncio
+    async def test_single_file_copy(self) -> None:
         """Test copying a single file to multiple destinations."""
         source_file = self.source_dir / "file1.txt"
 
@@ -459,7 +474,7 @@ class TestCLIProcessor(unittest.TestCase):
             hash_algorithm="xxh64be",
         )
 
-        success = processor.run()
+        success = await processor.run()
 
         self.assertTrue(success)
         self.assertTrue((self.dest1 / "file1.txt").exists())
@@ -467,7 +482,8 @@ class TestCLIProcessor(unittest.TestCase):
         self.assertEqual((self.dest1 / "file1.txt").read_text(), "content1")
         self.assertEqual((self.dest2 / "file1.txt").read_text(), "content1")
 
-    def test_directory_copy_preserves_structure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_directory_copy_preserves_structure(self) -> None:
         """Test that directory copying preserves directory structure."""
         processor = CLIProcessor(
             source=self.source_dir,
@@ -476,7 +492,7 @@ class TestCLIProcessor(unittest.TestCase):
             hash_algorithm="xxh64be",
         )
 
-        success = processor.run()
+        success = await processor.run()
 
         self.assertTrue(success)
 
@@ -537,7 +553,8 @@ class TestIntegration(unittest.TestCase):
         """Clean up test directory."""
         shutil.rmtree(self.test_dir)
 
-    def test_full_workflow_multiple_files_multiple_destinations(self) -> None:
+    @pytest.mark.asyncio
+    async def test_full_workflow_multiple_files_multiple_destinations(self) -> None:
         """Test complete workflow: multiple files to multiple destinations with full verification."""
         # Create source files
         source_dir = self.test_path / "source"
@@ -566,7 +583,7 @@ class TestIntegration(unittest.TestCase):
             hash_algorithm="xxh64be",
         )
 
-        success = processor.run()
+        success = await processor.run()
 
         # Verify success
         self.assertTrue(success)
