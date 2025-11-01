@@ -833,34 +833,33 @@ class CopyEngine:
         hashes = {}
 
         try:
-            # Create tasks for all files
-            tasks = [hash_file_with_progress(path) for path in files_to_hash]
+            # Create coroutines for all files
+            coros = [hash_file_with_progress(path) for path in files_to_hash]
 
-            # Create a task to monitor progress while hashing happens
-            async def monitor_progress():
-                last_reported = 0
-                while True:
-                    async with progress_lock:
-                        current_bytes = shared_progress["bytes_hashed"]
+            # Monitor progress while hashing happens
+            # Start all hash tasks
+            gather_task = asyncio.gather(*coros, return_exceptions=True)
 
-                    if current_bytes > last_reported:
-                        yield CopyEvent(
-                            type=EventType.VERIFY_PROGRESS,
-                            bytes_processed=current_bytes,
-                            total_bytes=total_bytes,
-                        )
-                        last_reported = current_bytes
+            last_reported = 0
+            while True:
+                # Check if gathering is done
+                done, pending = await asyncio.wait([gather_task], timeout=0.1)
 
-                    await asyncio.sleep(0.1)  # Check every 100ms
+                async with progress_lock:
+                    current_bytes = shared_progress["bytes_hashed"]
 
-            # Run hashing and progress monitoring concurrently
-            monitor_task = asyncio.create_task(monitor_progress().__anext__())
+                if current_bytes > last_reported:
+                    yield CopyEvent(
+                        type=EventType.VERIFY_PROGRESS,
+                        bytes_processed=current_bytes,
+                        total_bytes=total_bytes,
+                    )
+                    last_reported = current_bytes
 
-            # Wait for all hashing to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Cancel monitoring
-            monitor_task.cancel()
+                # If gathering is complete, break
+                if done:
+                    results = await gather_task
+                    break
 
             # Process results
             for path, result_or_exc in zip(files_to_hash, results):
