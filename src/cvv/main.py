@@ -565,7 +565,9 @@ class CopyEngine:
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-    async def _stream_to_destinations(self, enable_hashing: bool) -> AsyncIterator[int | str]:
+    async def _stream_to_destinations(
+        self, enable_hashing: bool
+    ) -> AsyncIterator[int | str]:
         """
         Read source once, write to multiple destinations concurrently.
 
@@ -594,7 +596,7 @@ class CopyEngine:
             for dest_path in self.destinations:
                 temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
                 # Open file with explicit large buffer for better performance
-                dest_file = await aiofiles.open(temp_path, 'wb', buffering=BUFFER_SIZE)
+                dest_file = await aiofiles.open(temp_path, "wb", buffering=BUFFER_SIZE)
                 dest_files.append(dest_file)
                 temp_paths.append((dest_path, temp_path))
 
@@ -605,7 +607,7 @@ class CopyEngine:
             progress_interval = 0.1  # Throttle progress to max 10 updates/second
 
             # Read source and write to all destinations concurrently
-            async with aiofiles.open(self.source, 'rb') as f_source:
+            async with aiofiles.open(self.source, "rb") as f_source:
                 while not self._abort_event.is_set():
                     chunk = await f_source.read(BUFFER_SIZE)
                     if not chunk:
@@ -619,10 +621,9 @@ class CopyEngine:
                     # Write to ALL destinations concurrently (no queue bottleneck!)
                     if not self._abort_event.is_set():
                         try:
-                            await asyncio.gather(*[
-                                dest_file.write(chunk)
-                                for dest_file in dest_files
-                            ])
+                            await asyncio.gather(
+                                *[dest_file.write(chunk) for dest_file in dest_files]
+                            )
                         except Exception as e:
                             raise OSError(f"Write error: {e}")
 
@@ -654,7 +655,9 @@ class CopyEngine:
                     try:
                         temp_path.replace(dest_path)
                     except Exception as e:
-                        raise OSError(f"Failed to rename {temp_path} to {dest_path}: {e}")
+                        raise OSError(
+                            f"Failed to rename {temp_path} to {dest_path}: {e}"
+                        )
             else:
                 # On abort, clean up temp files if not interrupted by Ctrl+C
                 if not self._interrupted:
@@ -735,7 +738,9 @@ class CopyEngine:
         # Note: We still use threading.Event for abort_event (signal handling)
         # but check it in async context - this is fine
         async for bytes_hashed, final_hash in HashCalculator.hash_file_async(
-            self.source, self.hash_algorithm, None  # Don't pass threading.Event to async
+            self.source,
+            self.hash_algorithm,
+            None,  # Don't pass threading.Event to async
         ):
             # Check for abort manually
             if self._abort_event.is_set():
