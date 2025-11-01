@@ -1,0 +1,415 @@
+* 1
+Perfect! I can see the main.py file. This is an excellent example of asyncio in action for file I/O operations. Let me break down how asyncio works in
+this codebase, step by step, as your interactive tutor.
+
+---
+Part 1: Understanding the Basics - What is asyncio?
+
+You mentioned you know asyncio enables "non-blocking execution." Let me make that concrete:
+
+Traditional (blocking) file I/O:
+# This blocks - your program waits here doing NOTHING
+data = file.read()  # ← Program frozen until disk returns data
+# Only now can we continue
+
+Async (non-blocking) file I/O:
+# This doesn't block - program can do other work while waiting
+data = await file.read()  # ← Says "I'll wait, but you can do other things"
+# Other tasks can run while disk is working!
+
+---
+Part 2: The Key asyncio Components in This Code
+
+Let me identify the main asyncio pieces in main.py:
+
+1. The Entry Point - asyncio.run() (Line 1359)
+
+success = asyncio.run(processor.run())
+
+What this does:
+- asyncio.run() is the gateway from normal Python to async Python
+- It creates an event loop (the engine that manages async tasks)
+- It runs the processor.run() async function until completion
+- When done, it cleans up and returns the result
+
+Think of it like: Starting a factory assembly line. The event loop is the conveyor belt that coordinates all workers.
+
+---
+2. Async Functions - Marked with async def (Lines 251, 413, 568, 715, 771, 965)
+
+Look at these function signatures:
+
+async def hash_file_async(...)  # Line 251
+async def copy(self)            # Line 413
+async def _stream_to_destinations(...)  # Line 568
+async def run(self)             # Line 965
+
+What async def means:
+- This function is a coroutine - it can pause and resume
+- It can use await to wait for I/O without blocking
+- It returns a coroutine object, not the actual result
+
+Important: You can ONLY call async functions using await (or with asyncio.run() at the top level)
+
+---
+3. The Magic Keywords: await and async for
+
+Let me show you the most important asyncio operations in this code:
+
+A. Opening Files Asynchronously (Line 282, 610)
+
+async with aiofiles.open(path, "rb") as f:
+    while chunk := await f.read(BUFFER_SIZE):
+
+Breaking this down:
+1. aiofiles.open() - Opens file in async mode (from the aiofiles library, line 31)
+2. async with - Like normal with, but for async context managers
+3. await f.read() - Reads data WITHOUT blocking the event loop
+
+What's happening under the hood:
+1. Request read from disk
+2. While waiting for disk, event loop can run OTHER async tasks
+3. When disk returns data, resume this function
+4. Process the data
+
+---
+B. Parallel Writing with asyncio.gather() (Line 624)
+
+This is BRILLIANT and shows the real power of asyncio:
+
+await asyncio.gather(
+    *[dest_file.write(chunk) for dest_file in dest_files]
+)
+
+What this does:
+- Takes a chunk of data (8MB buffer)
+- Writes to ALL destination files at the same time (concurrently)
+- Waits for ALL writes to complete before continuing
+
+Visual representation:
+Read one 8MB chunk from source
+    ↓
+    ├─→ Write to dest1.tmp ─┐
+    ├─→ Write to dest2.tmp ─┼─→ All happen at same time!
+    └─→ Write to dest3.tmp ─┘
+    ↓
+All done, read next chunk
+
+Why this is fast: Instead of write→wait→write→wait→write, it's write+write+write→wait for all.
+
+---
+C. Async Iteration with async for (Line 283, 452, 740, 815)
+
+async for chunk := await f.read(BUFFER_SIZE):
+    # Process chunk
+
+What async for does:
+- Like a normal for loop, but each iteration can involve async operations
+- The loop body runs, then awaits the next iteration
+- Other tasks can run between iterations
+
+---
+Part 3: Real Execution Flow - Let's Trace a Copy Operation
+
+Let me walk you through exactly what happens when you run:
+cvv source.mp4 /dest1 /dest2
+
+Step 1: Entry (Line 1359)
+
+success = asyncio.run(processor.run())
+- Creates event loop
+- Schedules processor.run() as the main task
+
+Step 2: CLI Processor (Line 965-991)
+
+async def run(self) -> bool:
+    source_files = self._discover_files()  # Find files to copy
+
+    for source_file in source_files:
+        result = await self._execute_single_copy(source_file, dest_paths)
+- Discovers files (synchronous - no I/O needed)
+- For each file, calls _execute_single_copy() with await
+
+Step 3: Execute Single Copy (Line 1158)
+
+async for event in engine.copy():
+    if isinstance(event, CopyResult):
+        result = event
+- Creates a CopyEngine instance
+- async for iterates over events from engine.copy()
+- This is where the real work happens!
+
+Step 4: The Core Copy Engine (Line 413-501)
+
+async def copy(self) -> AsyncIterator[CopyEvent | CopyResult]:
+    # Get source size (synchronous)
+    source_size = self.source.stat().st_size
+
+    # Copy phase
+    async for event_or_hash in self._stream_to_destinations(enable_hashing):
+        if isinstance(event_or_hash, str):
+            result.source_hash_inflight = event_or_hash
+        else:
+            yield CopyEvent(...)  # Progress update
+
+    # Verification phase
+    async for event in self._verify_full(result):
+        yield event
+
+Key concept here: This is an async generator. It yields events as it progresses.
+
+---
+Step 5: The Heart - Stream to Destinations (Line 568-668)
+
+This is where the real asyncio magic happens. Let me break it down in detail:
+
+async def _stream_to_destinations(self, enable_hashing) -> AsyncIterator[int | str]:
+
+Phase A: Open all destination files (Line 596-601)
+
+for dest_path in self.destinations:
+    temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+    dest_file = await aiofiles.open(temp_path, "wb", buffering=BUFFER_SIZE)
+    dest_files.append(dest_file)
+
+What's happening:
+- Opens each destination file asynchronously
+- Each await allows other tasks to run
+- Files are opened with large buffer (8MB) for performance
+
+Phase B: The Main Copy Loop (Line 610-635)
+
+async with aiofiles.open(self.source, "rb") as f_source:
+    while not self._abort_event.is_set():
+        chunk = await f_source.read(BUFFER_SIZE)  # ← Read 8MB
+        if not chunk:
+            break
+
+        if hasher:
+            hasher.update(chunk)  # Hash in memory (fast!)
+
+        bytes_read += len(chunk)
+
+        # Write to ALL destinations concurrently
+        await asyncio.gather(
+            *[dest_file.write(chunk) for dest_file in dest_files]
+        )
+
+        # Throttled progress updates
+        if current_time - last_progress_time >= progress_interval:
+            yield bytes_read
+
+Let's trace ONE iteration:
+
+1. await f_source.read(BUFFER_SIZE) (Line 612)
+  - Requests 8MB from source file
+  - Yields control to event loop while waiting
+  - When data arrives, resumes here with chunk
+2. hasher.update(chunk) (Line 617)
+  - Synchronous (no await!) - hashing is CPU-bound, not I/O
+  - Happens in memory, very fast
+3. await asyncio.gather(...) (Line 624-626)
+  - Creates a write coroutine for EACH destination
+  - Starts all writes simultaneously
+  - Waits for ALL to complete
+
+Visual timeline:
+Time ─────────────────────────────────────────────→
+
+Read 8MB from source ████░░░░░░░░░░░░░░ (disk busy, CPU idle)
+                        ↓ chunk ready
+Hash in memory          ░█ (CPU busy, very fast)
+                         ↓
+Write to dest1          ░░████░░░░░ ┐
+Write to dest2          ░░░██████░░ ├─ All happen together!
+Write to dest3          ░░███████░░ ┘
+                                  ↓ all done
+Yield progress update             █
+Loop back to read next chunk      ↓
+
+Without asyncio (synchronous):
+Read 8MB     ████░░░░░░░░░░░
+Hash         ░░░░█
+Write dest1  ░░░░░████░░░░░░░░░░  ← Sequential!
+Write dest2  ░░░░░░░░░████░░░░░░  ← Waiting...
+Write dest3  ░░░░░░░░░░░░░████░░  ← Waiting...
+             └─ Much longer! ─┘
+
+---
+Step 6: Parallel Verification (Line 771-907)
+
+The _verify_full() method shows advanced asyncio - parallel hashing:
+
+async def hash_file_with_progress(path: Path) -> tuple[Path, str]:
+    async for bytes_hashed, final_hash in HashCalculator.hash_file_async(...):
+        # Update shared progress
+        async with progress_lock:
+            shared_progress["bytes_hashed"] += delta
+
+# Hash ALL files in parallel
+coros = [hash_file_with_progress(path) for path in files_to_hash]
+gather_task = asyncio.gather(*coros, return_exceptions=True)
+
+What's happening:
+1. Creates a coroutine for EACH file (source + all destinations)
+2. asyncio.gather() runs them ALL in parallel
+3. Each file is being hashed at the same time!
+4. Progress is tracked with an async lock (Line 826, 848)
+
+Why use a lock? Multiple async tasks are updating shared_progress simultaneously - the lock prevents race conditions.
+
+---
+Part 4: Key Asyncio Concepts Demonstrated
+
+1. AsyncIterator and Generators (Line 255, 413, 570)
+
+async def hash_file_async(...) -> AsyncIterator[tuple[int, str]]:
+    async with aiofiles.open(path, "rb") as f:
+        while chunk := await f.read(BUFFER_SIZE):
+            yield (total_bytes, "")  # Progress
+    yield (total_bytes, hasher.hexdigest())  # Final result
+
+Two types of yields:
+- Progress yields: Empty string, just byte count
+- Final yield: Contains the complete hash
+
+Why use async generators? They allow streaming results without waiting for completion.
+
+---
+2. Async Context Managers (Line 282, 610)
+
+async with aiofiles.open(path, "rb") as f:
+    # File operations
+
+What async with does:
+- Calls __aenter__() with await (opens file)
+- Executes block
+- Calls __aexit__() with await (closes file)
+- Guarantees cleanup even if errors occur
+
+---
+3. Concurrency with asyncio.gather() (Line 624, 841)
+
+await asyncio.gather(*[dest_file.write(chunk) for dest_file in dest_files])
+
+Parameters:
+- Takes multiple coroutines
+- * unpacks the list
+- return_exceptions=True (Line 841) catches errors instead of raising
+
+Returns: List of results in the same order as input coroutines
+
+---
+4. Async Locks (Line 796, 826, 848)
+
+progress_lock = asyncio.Lock()
+
+async with progress_lock:
+    shared_progress["bytes_hashed"] += delta
+
+Why needed? When multiple async tasks modify shared data, we need synchronization.
+
+How it works:
+- Task A acquires lock
+- Task B tries to acquire → yields until A releases
+- No busy-waiting, just suspends
+
+---
+Part 5: Performance Benefits
+
+Let me show you why asyncio is perfect for this use case:
+
+Scenario: Copy 1GB file to 3 destinations
+
+Synchronous (no asyncio):
+Read 8MB: 10ms
+Hash 8MB: 1ms
+Write dest1: 10ms → Total: 30ms per dest
+Write dest2: 10ms
+Write dest3: 10ms
+────────────────────
+Per 8MB chunk: 51ms
+Total chunks: 128
+Total time: 6.5 seconds
+
+Async with this code:
+Read 8MB: 10ms
+Hash 8MB: 1ms
+Write all 3 (parallel): 10ms → All at same time!
+────────────────────
+Per 8MB chunk: 21ms
+Total chunks: 128
+Total time: 2.7 seconds
+
+Speedup: ~2.4x for 3 destinations!
+
+The more destinations, the bigger the benefit.
+
+---
+Part 6: Common Asyncio Patterns Used
+
+Pattern 1: Read-Process-Write Pipeline (Line 610-635)
+
+async with source_file:
+    while chunk := await read():
+        process(chunk)        # Synchronous
+        await write_all(chunk)  # Async, parallel
+
+Pattern 2: Fan-out (Parallel Execution) (Line 624, 837)
+
+await asyncio.gather(*[task(item) for item in items])
+
+Pattern 3: Progress Monitoring (Line 840-862)
+
+gather_task = asyncio.gather(*coros)
+while True:
+    done, pending = await asyncio.wait([gather_task], timeout=0.1)
+    # Check progress
+    if done:
+        break
+
+---
+Part 7: Mixing Sync and Async
+
+Notice the code carefully separates:
+
+Synchronous operations:
+- Hashing (CPU-bound): Line 617, 237
+- File size checks: Line 433, 679
+- Path operations: Line 548, 565
+
+Asynchronous operations:
+- File reads: Line 612
+- File writes: Line 624
+- Opening files: Line 599
+
+Rule: Use await only for I/O-bound operations. CPU-bound work stays synchronous.
+
+---
+Summary: The Complete Flow
+
+main() [sync]
+  └─→ asyncio.run(processor.run()) [creates event loop]
+        └─→ processor.run() [async]
+              └─→ _execute_single_copy() [async]
+                    └─→ engine.copy() [async generator]
+                          ├─→ _stream_to_destinations() [async generator]
+                          │     ├─→ aiofiles.open() [async]
+                          │     ├─→ f.read() [async]
+                          │     └─→ asyncio.gather(write, write, write) [parallel async]
+                          │
+                          └─→ _verify_full() [async generator]
+                                └─→ asyncio.gather(hash, hash, hash) [parallel async]
+
+---
+Questions to Check Understanding
+
+1. Why does line 617 NOT use await? (Hint: What kind of operation is hashing?)
+2. What would happen if line 624 wrote sequentially instead of using asyncio.gather()?
+3. Why can't you call engine.copy() without await or async for?
+
+Would you like me to:
+1. Dive deeper into any specific part?
+2. Explain asyncio.Lock() in more detail?
+3. Show you how to modify this code to add features?
+4. Explain the event loop internals?
