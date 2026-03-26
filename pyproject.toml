@@ -5,7 +5,7 @@ description = "File copy tool with one read, multiple writes. Copying in paralle
 readme = "README.md"
 authors = [{ name = "thomjiji", email = "hxy449999@gmail.com" }]
 requires-python = ">=3.9"
-dependencies = ["xxhash>=3.6.0"]
+dependencies = ["rich>=13.9.4", "xxhash>=3.6.0"]
 
 [project.scripts]
 cvv = "cvv:main"

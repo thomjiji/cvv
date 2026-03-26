@@ -35,6 +35,16 @@ except ImportError:
     print("Please install it using: pip install xxhash", file=sys.stderr)
     sys.exit(1)
 
+from .ui import (
+    DestinationInspection,
+    FileWorkPlan,
+    RICH_TUI_AVAILABLE,
+    RichTuiRenderer,
+    SessionProgressState,
+    TextRenderer,
+    ThroughputTracker,
+)
+
 # Constants
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
 QUEUE_SIZE = 10  # Max chunks buffered per destination
@@ -967,11 +977,13 @@ class CLIProcessor:
         destinations: list[Path],
         verification_mode: VerificationMode,
         hash_algorithm: str,
+        ui_mode: str = "text",
     ):
         self.source = source
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
+        self.ui_mode = ui_mode
 
     def run(self) -> bool:
         """
@@ -989,28 +1001,49 @@ class CLIProcessor:
             print("No files to copy")
             return True
 
-        # Execute each copy job
+        plans = [
+            self._build_file_plan(source_file, self._calculate_destinations(source_file))
+            for source_file in source_files
+        ]
+        state = SessionProgressState(
+            total_files=len(plans),
+            session_work_total=sum(plan.total_work_bytes for plan in plans),
+            verification_mode=self.verification_mode.value,
+            hash_algorithm=self.hash_algorithm,
+        )
+        renderer = self._resolve_renderer(state)
+        renderer.start_session(state)
+
         results = []
-        for i, source_file in enumerate(source_files, 1):
+        completed_work_bytes = 0
+
+        for i, plan in enumerate(plans, 1):
             # Check if user pressed Ctrl+C (before starting next file)
             if CopyEngine._shared_abort_event.is_set():
                 break
 
-            print(f"\nFile {i}/{len(source_files)}: {source_file.name}")
+            self._prepare_file_state(state, plan, i, completed_work_bytes)
+            renderer.start_file(state)
 
-            dest_paths = self._calculate_destinations(source_file)
-            result = self._execute_single_copy(source_file, dest_paths)
+            for message in self._prepare_copy_targets(plan):
+                state.last_message = message.strip()
+                renderer.note(message)
+
+            result = self._execute_single_copy(plan, state, renderer, completed_work_bytes)
             results.append(result)
+            completed_work_bytes += state.current_file_work_done
+            state.completed_files = i
 
-            # Show result summary
-            self._show_result_summary(result)
+            renderer.finish_file(result)
 
             if not result.success:
-                print("Operation failed, stopping.")
+                failure_message = "Operation failed, stopping."
+                state.last_message = failure_message
+                renderer.note(failure_message)
                 break
 
         # Final summary
-        self._show_final_summary(results)
+        renderer.finish_session(results)
 
         return all(r.success for r in results)
 
@@ -1065,240 +1098,292 @@ class CLIProcessor:
 
         return dest_paths
 
-    def _check_duplicates_and_cleanup(
-        self, source: Path, destinations: list[Path]
-    ) -> list[Path]:
+    def _resolve_renderer(self, state: SessionProgressState):
         """
-        Check for duplicate files and clean up incomplete .tmp files.
+        Create the appropriate renderer for the current terminal.
 
         Parameters
         ----------
-        source : Path
-            Source file path
-        destinations : list[Path]
-            List of destination paths
+        state : SessionProgressState
+            Shared progress state, updated with fallback information if needed
+        """
+        if self.ui_mode == "text":
+            return TextRenderer(self.hash_algorithm)
 
-        Returns
-        -------
-        list[Path]
-            List of destinations that need to be copied (excluding duplicates)
+        if not sys.stdout.isatty():
+            state.fallback_message = "stdout is not a TTY; falling back to text mode."
+            return TextRenderer(self.hash_algorithm)
 
-        Notes
-        -----
-        Priority 1: Skip already-completed files (duplication detection)
-        Priority 2: Clean up incomplete .tmp files (restart from beginning)
+        if not RICH_TUI_AVAILABLE:
+            state.fallback_message = (
+                "Rich is not installed; falling back to text mode."
+            )
+            return TextRenderer(self.hash_algorithm)
+
+        return RichTuiRenderer(self.hash_algorithm)
+
+    def _build_file_plan(
+        self, source: Path, destinations: list[Path]
+    ) -> FileWorkPlan:
+        """
+        Inspect a file copy job and compute expected work for session progress.
         """
         source_size = source.stat().st_size
-        destinations_to_copy = []
+        inspections: list[DestinationInspection] = []
+        messages: list[str] = []
 
         for dest in destinations:
-            # Priority 1: Check if destination file already exists and is complete
-            if dest.exists():
-                dest_size = dest.stat().st_size
-                if dest_size == source_size:
-                    print(f"  ✓ {dest.name} already exists (skipping)")
-                    continue
-                else:
-                    print(
-                        f"  ! {dest.name} exists but wrong size "
-                        f"({dest_size} vs {source_size}), will overwrite"
-                    )
-                    dest.unlink()
+            inspection = DestinationInspection(
+                path=dest,
+                tmp_path=dest.with_suffix(dest.suffix + ".tmp"),
+            )
 
-            # Priority 2: Check for incomplete .tmp file - just delete it and restart
-            tmp_path = dest.with_suffix(dest.suffix + ".tmp")
-            if tmp_path.exists():
-                tmp_size = tmp_path.stat().st_size
-                mb_done = tmp_size / (1024 * 1024)
+            if dest.exists():
+                inspection.existing_size = dest.stat().st_size
+                if inspection.existing_size == source_size:
+                    inspection.skip_copy = True
+                    messages.append(f"  ✓ {dest.name} already exists (skipping)")
+                else:
+                    inspection.needs_delete_existing = True
+                    messages.append(
+                        f"  ! {dest.name} exists but wrong size "
+                        f"({inspection.existing_size} vs {source_size}), will overwrite"
+                    )
+
+            if inspection.tmp_path and inspection.tmp_path.exists():
+                inspection.tmp_size = inspection.tmp_path.stat().st_size
+                inspection.needs_delete_tmp = True
+                mb_done = inspection.tmp_size / (1024 * 1024)
                 source_mb = source_size / (1024 * 1024)
-                print(
-                    f"  ! Found incomplete {tmp_path.name} "
+                messages.append(
+                    f"  ! Found incomplete {inspection.tmp_path.name} "
                     f"({mb_done:.1f}/{source_mb:.1f} MB), restarting from beginning"
                 )
-                tmp_path.unlink()
 
-            destinations_to_copy.append(dest)
+            inspections.append(inspection)
 
-        return destinations_to_copy
+        destinations_to_copy = [
+            inspection.path for inspection in inspections if not inspection.skip_copy
+        ]
+        copy_bytes_total = source_size if destinations_to_copy else 0
+
+        if not destinations_to_copy or self.verification_mode == VerificationMode.TRANSFER:
+            verify_bytes_total = 0
+        elif self.verification_mode == VerificationMode.SOURCE:
+            verify_bytes_total = source_size
+        else:
+            verify_bytes_total = source_size * (1 + len(destinations_to_copy))
+
+        return FileWorkPlan(
+            source_path=source,
+            source_size=source_size,
+            destination_inspections=inspections,
+            copy_bytes_total=copy_bytes_total,
+            verify_bytes_total=verify_bytes_total,
+            preflight_messages=messages,
+        )
+
+    def _prepare_file_state(
+        self,
+        state: SessionProgressState,
+        plan: FileWorkPlan,
+        file_index: int,
+        completed_work_bytes: int,
+    ) -> None:
+        """Reset session state for a new file."""
+        state.current_file_index = file_index
+        state.current_file_name = plan.source_path.name
+        state.current_source_path = str(plan.source_path)
+        state.current_destination_count = len(plan.destinations_to_copy)
+        state.current_phase = "planning"
+        state.current_phase_bytes = 0
+        state.current_phase_total = 0
+        state.current_file_work_done = 0
+        state.current_file_work_total = plan.total_work_bytes
+        state.session_work_done = completed_work_bytes
+        state.last_message = (
+            "All destinations already complete"
+            if not plan.destinations_to_copy
+            else "Preparing destinations"
+        )
+
+    def _prepare_copy_targets(self, plan: FileWorkPlan) -> list[str]:
+        """
+        Apply preflight cleanup based on the previously inspected job plan.
+        """
+        for inspection in plan.destination_inspections:
+            if inspection.skip_copy:
+                continue
+            if inspection.needs_delete_existing and inspection.path.exists():
+                inspection.path.unlink()
+            if (
+                inspection.needs_delete_tmp
+                and inspection.tmp_path
+                and inspection.tmp_path.exists()
+            ):
+                inspection.tmp_path.unlink()
+        return plan.preflight_messages
+
+    def _create_skipped_result(self, plan: FileWorkPlan) -> CopyResult:
+        """Create a success result when every destination is already complete."""
+        result = CopyResult(
+            source_path=plan.source_path,
+            source_size=plan.source_size,
+            verification_mode=self.verification_mode,
+        )
+        for dest in plan.destinations:
+            result.destinations.append(
+                DestinationResult(
+                    path=dest,
+                    success=True,
+                    bytes_written=plan.source_size,
+                )
+            )
+        return result
 
     def _execute_single_copy(
-        self, source: Path, destinations: list[Path]
+        self,
+        plan: FileWorkPlan,
+        state: SessionProgressState,
+        renderer,
+        completed_work_bytes: int,
     ) -> CopyResult:
         """
-        Execute a single copy operation with simple text progress.
+        Execute a single copy operation and update the selected renderer.
 
         Parameters
         ----------
-        source : Path
-            Source file path
-        destinations : list[Path]
-            List of destination paths
+        plan : FileWorkPlan
+            Planned work for the current file
+        state : SessionProgressState
+            Shared mutable render state
+        renderer : object
+            Renderer selected for this session
+        completed_work_bytes : int
+            Work completed by previous files in the session
 
         Returns
         -------
         CopyResult
             Result of the copy operation
         """
-        # Check for duplicates and cleanup incomplete .tmp files
-        destinations_to_copy = self._check_duplicates_and_cleanup(source, destinations)
+        tracker = ThroughputTracker()
+        self._sync_tracker(state, tracker)
 
-        # If all destinations already exist, return success result
-        if not destinations_to_copy:
-            print("  ✓ All destinations already complete (nothing to copy)")
-            result = CopyResult(
-                source_path=source,
-                source_size=source.stat().st_size,
-                verification_mode=self.verification_mode,
-            )
-            # Create success results for all destinations
-            for dest in destinations:
-                result.destinations.append(DestinationResult(path=dest, success=True))
-            return result
+        if not plan.destinations_to_copy:
+            message = "  ✓ All destinations already complete (nothing to copy)"
+            state.last_message = message.strip()
+            renderer.note(message)
+            self._sync_tracker(state, tracker)
+            return self._create_skipped_result(plan)
 
         engine = CopyEngine(
-            source=source,
-            destinations=destinations_to_copy,
+            source=plan.source_path,
+            destinations=plan.destinations_to_copy,
             verification_mode=self.verification_mode,
             hash_algorithm=self.hash_algorithm,
         )
 
         result = None
-        copy_total = 0
-        verify_total = 0
 
         for event in engine.copy():
             if isinstance(event, CopyResult):
                 result = event
-                sys.stdout.write("\n")  # Newline after progress
-                sys.stdout.flush()
                 break
 
-            elif event.type == EventType.COPY_START:
-                copy_total = event.total_bytes
+            self._apply_progress_event(
+                state=state,
+                plan=plan,
+                tracker=tracker,
+                completed_work_bytes=completed_work_bytes,
+                event=event,
+            )
+            renderer.update(state, event.type.value)
 
-            elif event.type == EventType.COPY_PROGRESS:
-                percent = (
-                    (event.bytes_processed / copy_total * 100) if copy_total else 0
-                )
-                mb_done = event.bytes_processed / (1024 * 1024)
-                mb_total = copy_total / (1024 * 1024)
-                # Clear line and write progress
-                sys.stdout.write(
-                    f"\rCopying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
-                        80
-                    )
-                )
-                sys.stdout.flush()
+        if result and result.success:
+            state.current_file_work_done = plan.total_work_bytes
+            state.session_work_done = completed_work_bytes + plan.total_work_bytes
+            state.last_message = "File complete"
+        else:
+            state.last_message = "File failed"
 
-            elif event.type == EventType.VERIFY_START:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                verify_total = event.total_bytes
-
-            elif event.type == EventType.VERIFY_PROGRESS:
-                percent = (
-                    (event.bytes_processed / verify_total * 100) if verify_total else 0
-                )
-                mb_done = event.bytes_processed / (1024 * 1024)
-                mb_total = verify_total / (1024 * 1024)
-                # Clear line and write progress
-                sys.stdout.write(
-                    f"\rVerifying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
-                        80
-                    )
-                )
-                sys.stdout.flush()
+        state.current_phase = "complete" if result and result.success else "failed"
+        state.current_phase_bytes = 0
+        state.current_phase_total = 0
+        self._sync_tracker(state, tracker)
 
         return result
 
-    def _show_result_summary(self, result: CopyResult) -> None:
-        """
-        Display a summary of a single copy operation.
+    def _apply_progress_event(
+        self,
+        state: SessionProgressState,
+        plan: FileWorkPlan,
+        tracker: ThroughputTracker,
+        completed_work_bytes: int,
+        event: CopyEvent,
+    ) -> None:
+        """Update shared UI state from a low-level copy event."""
+        if event.type == EventType.COPY_START:
+            tracker.set_phase("copy")
+            state.current_phase = "copy"
+            state.current_phase_bytes = 0
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = 0
+            state.session_work_done = completed_work_bytes
+            state.last_message = event.message or "Copying"
+        elif event.type == EventType.COPY_PROGRESS:
+            tracker.record("copy", event.bytes_processed)
+            state.current_phase = "copy"
+            state.current_phase_bytes = event.bytes_processed
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = min(plan.copy_bytes_total, event.bytes_processed)
+            state.session_work_done = completed_work_bytes + state.current_file_work_done
+        elif event.type == EventType.COPY_COMPLETE:
+            tracker.finish_phase("copy")
+            state.current_phase = "copy"
+            state.current_phase_bytes = event.bytes_processed
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = plan.copy_bytes_total
+            state.session_work_done = completed_work_bytes + plan.copy_bytes_total
+            state.last_message = event.message or "Copy phase complete"
+        elif event.type == EventType.VERIFY_START:
+            tracker.set_phase("verify")
+            state.current_phase = "verify"
+            state.current_phase_bytes = 0
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = plan.copy_bytes_total
+            state.session_work_done = completed_work_bytes + plan.copy_bytes_total
+            state.last_message = event.message or "Verifying"
+        elif event.type == EventType.VERIFY_PROGRESS:
+            tracker.record("verify", event.bytes_processed)
+            state.current_phase = "verify"
+            state.current_phase_bytes = event.bytes_processed
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = plan.copy_bytes_total + event.bytes_processed
+            state.session_work_done = completed_work_bytes + state.current_file_work_done
+        elif event.type == EventType.VERIFY_COMPLETE:
+            tracker.finish_phase("verify")
+            state.current_phase = "verify"
+            state.current_phase_bytes = event.bytes_processed
+            state.current_phase_total = event.total_bytes
+            state.current_file_work_done = plan.total_work_bytes
+            state.session_work_done = completed_work_bytes + plan.total_work_bytes
+            state.last_message = event.message or "Verification complete"
 
-        Parameters
-        ----------
-        result : CopyResult
-            Result of the copy operation to summarize
-        """
-        if result.success:
-            print(
-                f"✓ Success "
-                f"({result.speed_mb_sec:.2f} MB/s, "
-                f"{result.source_size / (1024 * 1024):.2f} MB)"
-            )
+        self._sync_tracker(state, tracker)
 
-            # Display hash information based on verification mode
-            if result.verification_mode == VerificationMode.TRANSFER:
-                # TRANSFER: Show in-flight hash
-                if result.source_hash_inflight:
-                    print(
-                        f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}"
-                    )
-
-            elif result.verification_mode == VerificationMode.SOURCE:
-                # SOURCE: Show both in-flight and post-copy hashes
-                if result.source_hash_inflight:
-                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
-                if result.source_hash_post:
-                    match_indicator = (
-                        "✓"
-                        if result.source_hash_post == result.source_hash_inflight
-                        else "✗"
-                    )
-                    print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
-
-            elif result.verification_mode == VerificationMode.FULL:
-                # FULL: Show source hashes and all destination hashes
-                if result.source_hash_inflight:
-                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
-                if result.source_hash_post:
-                    match_indicator = (
-                        "✓"
-                        if result.source_hash_post == result.source_hash_inflight
-                        else "✗"
-                    )
-                    print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
-
-                # Show each destination hash
-                for dest_result in result.destinations:
-                    if dest_result.hash_post:
-                        match_indicator = (
-                            "✓"
-                            if dest_result.hash_post == result.source_hash_inflight
-                            else "✗"
-                        )
-                        print(
-                            f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
-                        )
-        else:
-            print("✗ Failed")
-            for dest_result in result.destinations:
-                if not dest_result.success:
-                    print(f"  ✗ {dest_result.path.name}: {dest_result.error}")
-
-    def _show_final_summary(self, results: list[CopyResult]) -> None:
-        """
-        Display final summary of all operations.
-
-        Parameters
-        ----------
-        results : list[CopyResult]
-            List of all copy operation results
-        """
-        print("\n" + "=" * 60)
-
-        total = len(results)
-        success = sum(1 for r in results if r.success)
-        failed = total - success
-
-        if failed == 0:
-            print(f"All {total} operation(s) completed successfully")
-        else:
-            print(f"{failed} of {total} operation(s) failed")
+    def _sync_tracker(
+        self,
+        state: SessionProgressState,
+        tracker: ThroughputTracker,
+    ) -> None:
+        """Copy the tracker snapshot into renderer state."""
+        (
+            state.copy_history,
+            state.verify_history,
+            state.copy_rate_mb_sec,
+            state.verify_rate_mb_sec,
+        ) = tracker.snapshot()
 
 
 # ============================================================================
@@ -1306,15 +1391,8 @@ class CLIProcessor:
 # ============================================================================
 
 
-def main() -> int:
-    """
-    CLI entry point.
-
-    Returns
-    -------
-    int
-        Exit code: 0 for success, 1 for failure, 130 for keyboard interrupt
-    """
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="Professional file copying tool with integrity verification",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1356,6 +1434,27 @@ Examples:
         help="Hash algorithm for verification (default: xxh64be)",
     )
 
+    parser.add_argument(
+        "--ui",
+        type=str,
+        default="tui",
+        choices=["tui", "text"],
+        help="UI mode: tui for realtime dashboard, text for plain progress output (default: tui)",
+    )
+
+    return parser
+
+
+def main() -> int:
+    """
+    CLI entry point.
+
+    Returns
+    -------
+    int
+        Exit code: 0 for success, 1 for failure, 130 for keyboard interrupt
+    """
+    parser = build_parser()
     args = parser.parse_args()
 
     # Run the CLI processor
@@ -1365,6 +1464,7 @@ Examples:
             destinations=args.destinations,
             verification_mode=VerificationMode(args.mode),
             hash_algorithm=args.hash_algorithm,
+            ui_mode=args.ui,
         )
 
         success = processor.run()

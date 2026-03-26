@@ -30,7 +30,9 @@ from cvv import (
     EventType,
     HashCalculator,
     VerificationMode,
+    build_parser,
 )
+from cvv.ui import SessionProgressState, TextRenderer, ThroughputTracker
 
 
 class TestHashCalculator(unittest.TestCase):
@@ -522,6 +524,100 @@ class TestCLIProcessor(unittest.TestCase):
 
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0], source_file)
+
+    def test_tui_mode_falls_back_when_stdout_is_not_tty(self) -> None:
+        """TUI mode should gracefully fall back to text output in non-TTY tests."""
+        source_file = self.source_dir / "file1.txt"
+        processor = CLIProcessor(
+            source=source_file,
+            destinations=[self.dest1],
+            verification_mode=VerificationMode.TRANSFER,
+            hash_algorithm="xxh64be",
+            ui_mode="tui",
+        )
+
+        state = SessionProgressState()
+        with patch.object(sys.stdout, "isatty", return_value=False):
+            renderer = processor._resolve_renderer(state)
+
+        self.assertIsInstance(renderer, TextRenderer)
+        self.assertIn("falling back to text mode", state.fallback_message)
+
+
+class FakeClock:
+    """Simple controllable clock for throughput tracker tests."""
+
+    def __init__(self, start: float = 100.0):
+        self.current = start
+
+    def now(self) -> float:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current += seconds
+
+
+class TestThroughputTracker(unittest.TestCase):
+    """Test rolling throughput histories used by the TUI."""
+
+    def test_copy_rates_fill_the_history_window(self) -> None:
+        """Copy samples should accumulate into the trailing history."""
+        clock = FakeClock()
+        tracker = ThroughputTracker(window_seconds=4, clock=clock.now)
+
+        tracker.set_phase("copy")
+        tracker.record("copy", 0)
+        clock.advance(1)
+        tracker.record("copy", 5 * 1024 * 1024)
+        clock.advance(1)
+
+        copy_history, verify_history, copy_rate, verify_rate = tracker.snapshot()
+
+        self.assertAlmostEqual(copy_rate, 5.0, places=1)
+        self.assertEqual(copy_history[-1], 5.0)
+        self.assertEqual(verify_history[-1], 0.0)
+        self.assertEqual(verify_rate, 0.0)
+
+    def test_switching_to_verify_zero_fills_copy_series(self) -> None:
+        """When verify becomes active, copy should drop to zero in new buckets."""
+        clock = FakeClock()
+        tracker = ThroughputTracker(window_seconds=5, clock=clock.now)
+
+        tracker.set_phase("copy")
+        tracker.record("copy", 0)
+        clock.advance(1)
+        tracker.record("copy", 4 * 1024 * 1024)
+        clock.advance(1)
+        tracker.set_phase("verify")
+        tracker.record("verify", 0)
+        clock.advance(1)
+        tracker.record("verify", 3 * 1024 * 1024)
+        clock.advance(1)
+
+        copy_history, verify_history, copy_rate, verify_rate = tracker.snapshot()
+
+        self.assertEqual(copy_history[-1], 0.0)
+        self.assertAlmostEqual(verify_history[-1], 3.0, places=1)
+        self.assertEqual(copy_rate, 0.0)
+        self.assertAlmostEqual(verify_rate, 3.0, places=1)
+
+
+class TestCLIArguments(unittest.TestCase):
+    """Test parser behavior for the new UI mode."""
+
+    def test_parser_defaults_to_tui(self) -> None:
+        """The CLI should prefer the new TUI experience by default."""
+        parser = build_parser()
+        args = parser.parse_args(["source.mov", "dest.mov"])
+
+        self.assertEqual(args.ui, "tui")
+
+    def test_parser_accepts_text_ui_mode(self) -> None:
+        """Users should still be able to force classic text output."""
+        parser = build_parser()
+        args = parser.parse_args(["source.mov", "dest.mov", "--ui", "text"])
+
+        self.assertEqual(args.ui, "text")
 
 
 class TestIntegration(unittest.TestCase):

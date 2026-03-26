@@ -15,6 +15,7 @@ from .main import (
     EventType,
     HashCalculator,
     VerificationMode,
+    build_parser,
     main,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "EventType",
     "HashCalculator",
     "VerificationMode",
+    "build_parser",
     "main",
 ]
