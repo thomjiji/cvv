@@ -14,6 +14,7 @@ from .main import (
     DestinationResult,
     EventType,
     HashCalculator,
+    HashFileWriter,
     VerificationMode,
     main,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "DestinationResult",
     "EventType",
     "HashCalculator",
+    "HashFileWriter",
     "VerificationMode",
     "main",
 ]

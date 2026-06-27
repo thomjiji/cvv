@@ -29,6 +29,7 @@ from cvv import (
     CopyResult,
     EventType,
     HashCalculator,
+    HashFileWriter,
     VerificationMode,
 )
 
@@ -583,6 +584,184 @@ class TestIntegration(unittest.TestCase):
                 )
 
 
+class TestHashFileWriter(unittest.TestCase):
+    """Test hash file generation in .xxh and .mhl formats."""
+
+    def setUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.test_path = Path(self.test_dir)
+        self.entries = [
+            (Path("video.mp4"), "ED26553EDB44956D", 1234567),
+            (Path("subdir/audio.wav"), "0C27693DBFD5E7DA", 9876543),
+        ]
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.test_dir)
+
+    def test_write_xxh_format(self) -> None:
+        """Test TeraCopy-compatible .xxh file generation."""
+        output = self.test_path / "test.xxh"
+        HashFileWriter.write_xxh(self.entries, output, "xxh3_64")
+
+        self.assertTrue(output.exists())
+        content = output.read_text(encoding="utf-8")
+
+        # Header
+        self.assertIn("xxHash3-64", content)
+        self.assertIn("cvv", content)
+
+        # Entries: uppercase hash, asterisk prefix, forward slashes
+        self.assertIn("ED26553EDB44956D *video.mp4", content)
+        self.assertIn("0C27693DBFD5E7DA *subdir/audio.wav", content)
+
+    def test_write_xxh_different_algorithms(self) -> None:
+        """Test .xxh header reflects the algorithm used."""
+        for algo, expected_name in [
+            ("xxh64", "xxHash-64"),
+            ("md5", "MD5"),
+            ("sha256", "SHA-256"),
+        ]:
+            output = self.test_path / f"test_{algo}.xxh"
+            HashFileWriter.write_xxh(self.entries, output, algo)
+            content = output.read_text(encoding="utf-8")
+            self.assertIn(expected_name, content)
+
+    def test_write_mhl_format(self) -> None:
+        """Test ASC MHL XML file generation."""
+        path = HashFileWriter.write_mhl(
+            self.entries, self.test_path, "xxh3_64", "test_source"
+        )
+
+        self.assertTrue(path.exists())
+        self.assertTrue(path.parent.name == "ascmhl")
+
+        import xml.etree.ElementTree as ET
+
+        tree = ET.parse(path)
+        root = tree.getroot()
+
+        self.assertEqual(root.tag, "hashlist")
+        self.assertEqual(root.attrib["version"], "2.0")
+
+        # Creator info
+        creator = root.find("creatorinfo")
+        self.assertIsNotNone(creator)
+        self.assertEqual(creator.find("creationtool").text, "cvv 0.0.1")
+
+        # Hash entries
+        hashes = root.find("hashes")
+        hash_elems = hashes.findall("hash")
+        self.assertEqual(len(hash_elems), 2)
+
+        # First entry
+        self.assertEqual(hash_elems[0].find("path").text, "video.mp4")
+        self.assertEqual(hash_elems[0].find("path").attrib["size"], "1234567")
+        self.assertEqual(
+            hash_elems[0].find("xxh3_64").text, "ed26553edb44956d"
+        )
+
+        # Second entry (with subdirectory)
+        self.assertEqual(hash_elems[1].find("path").text, "subdir/audio.wav")
+
+    def test_write_mhl_creates_ascmhl_dir(self) -> None:
+        """Test that MHL writer creates the ascmhl/ subdirectory."""
+        ascmhl_dir = self.test_path / "ascmhl"
+        self.assertFalse(ascmhl_dir.exists())
+
+        HashFileWriter.write_mhl(self.entries, self.test_path, "xxh3_64", "src")
+
+        self.assertTrue(ascmhl_dir.exists())
+        self.assertTrue(ascmhl_dir.is_dir())
+
+
+class TestHashFileIntegration(unittest.TestCase):
+    """Test hash file generation integrated with CLIProcessor."""
+
+    def setUp(self) -> None:
+        CopyEngine.reset_shared_state()
+        self.test_dir = tempfile.mkdtemp()
+        self.test_path = Path(self.test_dir)
+
+        self.source_dir = self.test_path / "source"
+        self.source_dir.mkdir()
+        (self.source_dir / "file1.txt").write_bytes(b"content1")
+        (self.source_dir / "file2.txt").write_bytes(b"content2")
+
+        self.dest = self.test_path / "dest"
+        self.dest.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.test_dir)
+
+    def test_cli_generates_xxh_file(self) -> None:
+        """Test that CLIProcessor generates .xxh when requested."""
+        processor = CLIProcessor(
+            source=self.source_dir,
+            destinations=[self.dest],
+            verification_mode=VerificationMode.FULL,
+            hash_algorithm="xxh3_64",
+            hash_file_formats=["xxh"],
+        )
+
+        success = processor.run()
+        self.assertTrue(success)
+
+        xxh_file = self.dest / "source.xxh"
+        self.assertTrue(xxh_file.exists(), f"{xxh_file} should be generated")
+
+        content = xxh_file.read_text(encoding="utf-8")
+        self.assertIn("file1.txt", content)
+        self.assertIn("file2.txt", content)
+
+    def test_cli_generates_mhl_file(self) -> None:
+        """Test that CLIProcessor generates .mhl when requested."""
+        processor = CLIProcessor(
+            source=self.source_dir,
+            destinations=[self.dest],
+            verification_mode=VerificationMode.FULL,
+            hash_algorithm="xxh3_64",
+            hash_file_formats=["mhl"],
+        )
+
+        success = processor.run()
+        self.assertTrue(success)
+
+        ascmhl_dir = self.dest / "ascmhl"
+        self.assertTrue(ascmhl_dir.exists())
+        mhl_files = list(ascmhl_dir.glob("*.mhl"))
+        self.assertEqual(len(mhl_files), 1)
+
+    def test_cli_generates_both_formats(self) -> None:
+        """Test that CLIProcessor generates both .xxh and .mhl."""
+        processor = CLIProcessor(
+            source=self.source_dir,
+            destinations=[self.dest],
+            verification_mode=VerificationMode.FULL,
+            hash_algorithm="xxh3_64",
+            hash_file_formats=["xxh", "mhl"],
+        )
+
+        success = processor.run()
+        self.assertTrue(success)
+
+        self.assertTrue((self.dest / "source.xxh").exists())
+        self.assertTrue((self.dest / "ascmhl").exists())
+
+    def test_no_hash_file_without_flag(self) -> None:
+        """Test that no hash file is generated when not requested."""
+        processor = CLIProcessor(
+            source=self.source_dir,
+            destinations=[self.dest],
+            verification_mode=VerificationMode.FULL,
+            hash_algorithm="xxh3_64",
+        )
+
+        success = processor.run()
+        self.assertTrue(success)
+
+        self.assertFalse((self.dest / "source.xxh").exists())
+        self.assertFalse((self.dest / "ascmhl").exists())
+
+
 if __name__ == "__main__":
-    # Run tests with verbose output
     unittest.main(verbosity=2)

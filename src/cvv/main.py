@@ -22,9 +22,11 @@ import signal
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -39,6 +41,14 @@ except ImportError:
 BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
 QUEUE_SIZE = 10  # Max chunks buffered per destination
 
+HASH_FILE_EXTENSIONS = {
+    "xxh3_64": ".xxh",
+    "xxh64": ".xxh",
+    "md5": ".md5",
+    "sha1": ".sha1",
+    "sha256": ".sha256",
+}
+
 
 # ============================================================================
 # Data Models
@@ -46,18 +56,7 @@ QUEUE_SIZE = 10  # Max chunks buffered per destination
 
 
 class VerificationMode(Enum):
-    """
-    Verification strategy for copy operations.
-
-    Attributes
-    ----------
-    TRANSFER : str
-        File size comparison only
-    SOURCE : str
-        Hash source in-flight and post-copy
-    FULL : str
-        Hash source and all destinations post-copy
-    """
+    """Verification strategy for copy operations."""
 
     TRANSFER = "transfer"
     SOURCE = "source"
@@ -65,24 +64,7 @@ class VerificationMode(Enum):
 
 
 class EventType(Enum):
-    """
-    Events emitted during copy operations.
-
-    Attributes
-    ----------
-    COPY_START : str
-        Copy operation started
-    COPY_PROGRESS : str
-        Copy operation progress update
-    COPY_COMPLETE : str
-        Copy operation completed
-    VERIFY_START : str
-        Verification started
-    VERIFY_PROGRESS : str
-        Verification progress update
-    VERIFY_COMPLETE : str
-        Verification completed
-    """
+    """Events emitted during copy operations."""
 
     COPY_START = "copy_start"
     COPY_PROGRESS = "copy_progress"
@@ -94,20 +76,7 @@ class EventType(Enum):
 
 @dataclass
 class CopyEvent:
-    """
-    Event emitted during copy/verification operations.
-
-    Attributes
-    ----------
-    type : EventType
-        Type of event
-    bytes_processed : int, default=0
-        Number of bytes processed so far
-    total_bytes : int, default=0
-        Total bytes to process
-    message : str, default=""
-        Optional message describing the event
-    """
+    """Event emitted during copy/verification operations."""
 
     type: EventType
     bytes_processed: int = 0
@@ -117,22 +86,7 @@ class CopyEvent:
 
 @dataclass
 class DestinationResult:
-    """
-    Result for a single destination.
-
-    Attributes
-    ----------
-    path : Path
-        Destination file path
-    success : bool
-        Whether the copy operation succeeded
-    bytes_written : int, default=0
-        Number of bytes written to destination
-    hash_post : str | None, default=None
-        Post-copy hash of destination file
-    error : str | None, default=None
-        Error message if operation failed
-    """
+    """Result for a single destination."""
 
     path: Path
     success: bool
@@ -143,26 +97,7 @@ class DestinationResult:
 
 @dataclass
 class CopyResult:
-    """
-    Complete result of a multi-destination copy operation.
-
-    Attributes
-    ----------
-    source_path : Path
-        Source file path
-    source_size : int
-        Size of source file in bytes
-    destinations : list[DestinationResult], default=[]
-        Results for each destination
-    source_hash_inflight : str | None, default=None
-        Hash computed during copy (in-flight)
-    source_hash_post : str | None, default=None
-        Hash computed after copy (post-copy verification)
-    duration : float, default=0.0
-        Total operation duration in seconds
-    verification_mode : VerificationMode, default=VerificationMode.TRANSFER
-        Verification mode used for the operation
-    """
+    """Complete result of a multi-destination copy operation."""
 
     source_path: Path
     source_size: int
@@ -174,26 +109,10 @@ class CopyResult:
 
     @property
     def success(self) -> bool:
-        """
-        Check if all destinations succeeded.
-
-        Returns
-        -------
-        bool
-            True if all destination copies succeeded, False otherwise
-        """
         return all(d.success for d in self.destinations)
 
     @property
     def speed_mb_sec(self) -> float:
-        """
-        Calculate transfer speed in MB/s.
-
-        Returns
-        -------
-        float
-            Transfer speed in megabytes per second
-        """
         if self.duration > 0:
             return (self.source_size / (1024 * 1024)) / self.duration
         return 0.0
@@ -205,14 +124,7 @@ class CopyResult:
 
 
 class HashCalculator:
-    """
-    Thread-safe hash calculator supporting multiple algorithms.
-
-    Parameters
-    ----------
-    algorithm : str, default="xxh3_64"
-        Hash algorithm to use. Supported: xxh3_64, xxh64, md5, sha1, sha256
-    """
+    """Thread-safe hash calculator supporting multiple algorithms."""
 
     def __init__(self, algorithm: str = "xxh3_64"):
         self.algorithm = algorithm.lower()
@@ -226,25 +138,9 @@ class HashCalculator:
             raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
     def update(self, data: bytes) -> None:
-        """
-        Update hash with new data.
-
-        Parameters
-        ----------
-        data : bytes
-            Data chunk to add to the hash
-        """
         self._hasher.update(data)
 
     def hexdigest(self) -> str:
-        """
-        Get final hex digest.
-
-        Returns
-        -------
-        str
-            Hexadecimal string representation of the hash
-        """
         return self._hasher.hexdigest()
 
     @staticmethod
@@ -253,29 +149,7 @@ class HashCalculator:
         algorithm: str = "xxh3_64",
         abort_event: threading.Event | None = None,
     ) -> Iterator[tuple[int, str]]:
-        """
-        Hash a file and yield progress.
-
-        Parameters
-        ----------
-        path : Path
-            Path to file to hash
-        algorithm : str, default="xxh3_64"
-            Hash algorithm to use
-        abort_event : threading.Event | None, default=None
-            Event to check for abort signal
-
-        Yields
-        ------
-        tuple[int, str]
-            (bytes_hashed, final_hash_or_empty_string)
-            Progress updates yield empty string, final yield contains complete hash
-
-        Raises
-        ------
-        InterruptedError
-            If abort_event is set during hashing
-        """
+        """Hash a file and yield (bytes_hashed, hash_or_empty) progress tuples."""
         hasher = HashCalculator(algorithm)
         total_bytes = 0
 
@@ -293,24 +167,7 @@ class HashCalculator:
 
 
 class CopyEngine:
-    """
-    Core copy engine: reads source once, writes to multiple destinations.
-
-    This is completely UI-agnostic - it yields events and never touches stdout.
-
-    Parameters
-    ----------
-    source : Path
-        Source file path
-    destinations : list[Path]
-        List of destination file paths
-    verification_mode : VerificationMode, default=VerificationMode.FULL
-        Verification strategy to use
-    hash_algorithm : str, default="xxh3_64"
-        Hash algorithm for verification
-    abort_event : threading.Event | None, default=None
-        Optional custom abort event (uses shared event if None)
-    """
+    """Core copy engine: reads source once, writes to N destinations. Yields events, never touches stdout."""
 
     # Class-level shared abort event (persists across all instances)
     _shared_abort_event = threading.Event()
@@ -341,40 +198,17 @@ class CopyEngine:
 
     @classmethod
     def reset_shared_state(cls) -> None:
-        """
-        Reset the shared abort event (useful for testing).
-
-        Notes
-        -----
-        This is primarily used in test suites to ensure clean state between tests.
-        """
+        """Reset the shared abort event (for testing)."""
         cls._shared_abort_event.clear()
 
     def _handle_interrupt(self, signum, frame):
-        """
-        Handle Ctrl+C gracefully - stops all current and future operations.
-
-        Parameters
-        ----------
-        signum : int
-            Signal number
-        frame : frame
-            Current stack frame
-        """
         if not CopyEngine._shared_abort_event.is_set():
             CopyEngine._shared_abort_event.set()
             self._interrupted = True
             print("\n\nCopy interrupted.", file=sys.stderr)
 
     def copy(self) -> Iterator[CopyEvent | CopyResult]:
-        """
-        Execute the copy operation.
-
-        Yields
-        ------
-        CopyEvent | CopyResult
-            CopyEvent objects during operation, final yield is CopyResult
-        """
+        """Execute the copy operation, yielding progress events and a final CopyResult."""
         start_time = time.time()
 
         # Initialize result with defaults (will be updated if source exists)
@@ -455,49 +289,15 @@ class CopyEngine:
         yield result
 
     def abort(self) -> None:
-        """
-        Signal the copy operation to abort.
-
-        Notes
-        -----
-        Sets the abort event which causes all threads to exit gracefully.
-        """
         self._abort_event.set()
 
-    # ------------------------------------------------------------------------
-    # Internal methods
-    # ------------------------------------------------------------------------
-
     def _check_source_exists(self) -> None:
-        """
-        Verify source file exists and is readable.
-
-        Raises
-        ------
-        FileNotFoundError
-            If source file does not exist
-        ValueError
-            If source is not a file (e.g., is a directory)
-        """
         if not self.source.exists():
             raise FileNotFoundError(f"Source file not found: {self.source}")
         if not self.source.is_file():
             raise ValueError(f"Source is not a file: {self.source}")
 
     def _check_disk_space(self, required_bytes: int) -> None:
-        """
-        Verify sufficient disk space on all destinations.
-
-        Parameters
-        ----------
-        required_bytes : int
-            Number of bytes required for the copy operation
-
-        Raises
-        ------
-        OSError
-            If any destination has insufficient free space
-        """
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
             usage = shutil.disk_usage(dest.parent)
@@ -509,37 +309,11 @@ class CopyEngine:
                 )
 
     def _prepare_destinations(self) -> None:
-        """
-        Create destination directories.
-
-        Notes
-        -----
-        Creates parent directories for all destinations if they don't exist.
-        """
         for dest in self.destinations:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
     def _stream_to_destinations(self, enable_hashing: bool) -> Iterator[int | str]:
-        """
-        Read source once, fan out to multiple writers.
-
-        Parameters
-        ----------
-        enable_hashing : bool
-            Whether to compute hash during copy
-
-        Yields
-        ------
-        int | str
-            bytes_copied (int) during copy, then final hash (str) if enabled
-
-        Raises
-        ------
-        OSError
-            If writer threads encounter errors
-        InterruptedError
-            If operation is aborted
-        """
+        """Read source once, fan out to N writer threads via queues."""
         # Create queues and writer threads
         chunk_queues = [queue.Queue(maxsize=QUEUE_SIZE) for _ in self.destinations]
         writer_threads = []
@@ -626,25 +400,7 @@ class CopyEngine:
         chunk_queue: queue.Queue,
         error_dict: dict,
     ) -> None:
-        """
-        Writer thread: receives chunks and writes to temp file.
-
-        On success, atomically renames temp to final destination.
-
-        Parameters
-        ----------
-        dest_path : Path
-            Final destination file path
-        chunk_queue : queue.Queue
-            Queue from which to receive data chunks
-        error_dict : dict
-            Shared dictionary for reporting errors
-
-        Notes
-        -----
-        Writes to a .tmp file first, then atomically renames on success.
-        On Ctrl+C, preserves .tmp file for potential resume on next run.
-        """
+        """Write chunks from queue to a .tmp file, then atomically rename on success."""
         temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
         mode = "wb"  # Always start fresh (no resume from exact position)
 
@@ -682,14 +438,7 @@ class CopyEngine:
                         temp_path.unlink()
 
     def _verify_destinations_written(self) -> list[DestinationResult]:
-        """
-        Verify all destination files exist and have correct size.
-
-        Returns
-        -------
-        list[DestinationResult]
-            List of destination results with size verification status
-        """
+        """Verify all destination files exist and have correct size."""
         results = []
         source_size = self.source.stat().st_size
 
@@ -728,19 +477,7 @@ class CopyEngine:
         return results
 
     def _verify_source_only(self, result: CopyResult) -> Iterator[CopyEvent]:
-        """
-        SOURCE mode: Re-hash source file to ensure it didn't change during copy.
-
-        Parameters
-        ----------
-        result : CopyResult
-            Copy result to update with verification information
-
-        Yields
-        ------
-        CopyEvent
-            Verification progress events
-        """
+        """SOURCE mode: re-hash source to detect changes during copy."""
         yield CopyEvent(
             type=EventType.VERIFY_START,
             total_bytes=result.source_size,
@@ -776,19 +513,7 @@ class CopyEngine:
         )
 
     def _verify_full(self, result: CopyResult) -> Iterator[CopyEvent]:
-        """
-        FULL mode: Hash source and all destinations in parallel with real-time progress.
-
-        Parameters
-        ----------
-        result : CopyResult
-            Copy result to update with verification information
-
-        Yields
-        ------
-        CopyEvent
-            Verification progress events
-        """
+        """FULL mode: hash source and all destinations in parallel."""
         files_to_hash = [self.source] + self.destinations
         total_bytes = result.source_size * len(files_to_hash)
 
@@ -803,19 +528,6 @@ class CopyEngine:
         shared_progress = {"bytes_hashed": 0}
 
         def hash_file_with_progress(path: Path) -> tuple[Path, str]:
-            """
-            Hash a file and update shared progress counter in real-time.
-
-            Parameters
-            ----------
-            path : Path
-                File to hash
-
-            Returns
-            -------
-            tuple[Path, str]
-                (file_path, hash_digest)
-            """
             final_hash = ""
             last_bytes = 0
 
@@ -920,19 +632,6 @@ class CopyEngine:
         )
 
     def _hash_file_to_completion(self, path: Path) -> str:
-        """
-        Hash a file completely and return the final digest.
-
-        Parameters
-        ----------
-        path : Path
-            File to hash
-
-        Returns
-        -------
-        str
-            Final hash digest
-        """
         final_hash = ""
         for _, final_hash in HashCalculator.hash_file(path, self.hash_algorithm):
             if final_hash:
@@ -941,27 +640,78 @@ class CopyEngine:
 
 
 # ============================================================================
+# Hash File Writers
+# ============================================================================
+
+
+class HashFileWriter:
+    """Generates hash files in TeraCopy (.xxh) and ASC MHL formats."""
+
+    ALGO_DISPLAY = {
+        "xxh3_64": "xxHash3-64",
+        "xxh64": "xxHash-64",
+        "md5": "MD5",
+        "sha1": "SHA-1",
+        "sha256": "SHA-256",
+    }
+
+    @staticmethod
+    def write_xxh(
+        entries: list[tuple[Path, str, int]],
+        output_path: Path,
+        hash_algorithm: str,
+    ) -> Path:
+        """Write a TeraCopy-compatible hash file (.xxh/.md5/.sha1/.sha256)."""
+        algo_name = HashFileWriter.ALGO_DISPLAY.get(hash_algorithm, hash_algorithm)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"; {algo_name} checksums created by cvv\n")
+            f.write(";\n\n")
+            for rel_path, hash_hex, _size in entries:
+                f.write(f"{hash_hex.upper()} *{rel_path.as_posix()}\n")
+        return output_path
+
+    @staticmethod
+    def write_mhl(
+        entries: list[tuple[Path, str, int]],
+        output_dir: Path,
+        hash_algorithm: str,
+        source_name: str,
+    ) -> Path:
+        """Write an ASC MHL XML file in ascmhl/ subdirectory."""
+        ascmhl_dir = output_dir / "ascmhl"
+        ascmhl_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        timestamp = now.strftime("%Y-%m-%d_%H%M%S")
+        output_path = ascmhl_dir / f"0001_{source_name}_{timestamp}.mhl"
+
+        root = ET.Element("hashlist", version="2.0")
+
+        creator = ET.SubElement(root, "creatorinfo")
+        ET.SubElement(creator, "creationtool").text = "cvv 0.0.1"
+        ET.SubElement(creator, "creationdate").text = now.isoformat()
+
+        hashes_elem = ET.SubElement(root, "hashes")
+        for rel_path, hash_hex, size in entries:
+            hash_elem = ET.SubElement(hashes_elem, "hash")
+            path_elem = ET.SubElement(hash_elem, "path", size=str(size))
+            path_elem.text = rel_path.as_posix()
+            ET.SubElement(hash_elem, hash_algorithm).text = hash_hex.lower()
+
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="  ")
+        tree.write(output_path, encoding="UTF-8", xml_declaration=True)
+
+        return output_path
+
+
+# ============================================================================
 # CLI Layer (Presentation)
 # ============================================================================
 
 
 class CLIProcessor:
-    """
-    Handles CLI orchestration and presentation.
-
-    This layer is completely separate from the core copy engine.
-
-    Parameters
-    ----------
-    source : Path
-        Source file or directory path
-    destinations : list[Path]
-        List of destination paths
-    verification_mode : VerificationMode
-        Verification strategy to use
-    hash_algorithm : str
-        Hash algorithm for verification
-    """
+    """CLI orchestration and presentation layer."""
 
     def __init__(
         self,
@@ -969,21 +719,16 @@ class CLIProcessor:
         destinations: list[Path],
         verification_mode: VerificationMode,
         hash_algorithm: str,
+        hash_file_formats: list[str] | None = None,
     ):
         self.source = source
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
+        self.hash_file_formats = hash_file_formats or []
 
     def run(self) -> bool:
-        """
-        Execute copy jobs for all source files.
-
-        Returns
-        -------
-        bool
-            True if all operations succeeded, False otherwise
-        """
+        """Execute copy jobs for all source files."""
         # Discover files to copy
         source_files = self._discover_files()
 
@@ -1011,25 +756,17 @@ class CLIProcessor:
                 print("Operation failed, stopping.")
                 break
 
+        # Generate hash files
+        all_success = all(r.success for r in results)
+        if self.hash_file_formats and all_success and results:
+            self._generate_hash_files(results)
+
         # Final summary
         self._show_final_summary(results)
 
-        return all(r.success for r in results)
+        return all_success
 
     def _discover_files(self) -> list[Path]:
-        """
-        Discover all source files to copy.
-
-        Returns
-        -------
-        list[Path]
-            List of source files to copy
-
-        Raises
-        ------
-        FileNotFoundError
-            If source does not exist
-        """
         if self.source.is_file():
             return [self.source]
         elif self.source.is_dir():
@@ -1038,19 +775,6 @@ class CLIProcessor:
             raise FileNotFoundError(f"Source not found: {self.source}")
 
     def _calculate_destinations(self, source_file: Path) -> list[Path]:
-        """
-        Calculate destination paths for a source file.
-
-        Parameters
-        ----------
-        source_file : Path
-            Source file to calculate destinations for
-
-        Returns
-        -------
-        list[Path]
-            List of destination paths
-        """
         dest_paths = []
 
         # If source is a directory, preserve structure
@@ -1070,26 +794,7 @@ class CLIProcessor:
     def _check_duplicates_and_cleanup(
         self, source: Path, destinations: list[Path]
     ) -> list[Path]:
-        """
-        Check for duplicate files and clean up incomplete .tmp files.
-
-        Parameters
-        ----------
-        source : Path
-            Source file path
-        destinations : list[Path]
-            List of destination paths
-
-        Returns
-        -------
-        list[Path]
-            List of destinations that need to be copied (excluding duplicates)
-
-        Notes
-        -----
-        Priority 1: Skip already-completed files (duplication detection)
-        Priority 2: Clean up incomplete .tmp files (restart from beginning)
-        """
+        """Skip already-completed files and clean up incomplete .tmp files."""
         source_size = source.stat().st_size
         destinations_to_copy = []
 
@@ -1126,21 +831,6 @@ class CLIProcessor:
     def _execute_single_copy(
         self, source: Path, destinations: list[Path]
     ) -> CopyResult:
-        """
-        Execute a single copy operation with simple text progress.
-
-        Parameters
-        ----------
-        source : Path
-            Source file path
-        destinations : list[Path]
-            List of destination paths
-
-        Returns
-        -------
-        CopyResult
-            Result of the copy operation
-        """
         # Check for duplicates and cleanup incomplete .tmp files
         destinations_to_copy = self._check_duplicates_and_cleanup(source, destinations)
 
@@ -1214,14 +904,6 @@ class CLIProcessor:
         return result
 
     def _show_result_summary(self, result: CopyResult) -> None:
-        """
-        Display a summary of a single copy operation.
-
-        Parameters
-        ----------
-        result : CopyResult
-            Result of the copy operation to summarize
-        """
         if result.success:
             print(
                 f"✓ Success "
@@ -1283,14 +965,6 @@ class CLIProcessor:
                     print(f"  ✗ {dest_result.path.name}: {dest_result.error}")
 
     def _show_final_summary(self, results: list[CopyResult]) -> None:
-        """
-        Display final summary of all operations.
-
-        Parameters
-        ----------
-        results : list[CopyResult]
-            List of all copy operation results
-        """
         print("\n" + "=" * 60)
 
         total = len(results)
@@ -1302,6 +976,50 @@ class CLIProcessor:
         else:
             print(f"{failed} of {total} operation(s) failed")
 
+    def _generate_hash_files(self, results: list[CopyResult]) -> None:
+        """Write hash files at each destination after all copies complete."""
+        source_name = self.source.stem if self.source.is_file() else self.source.name
+        ext = HASH_FILE_EXTENSIONS.get(self.hash_algorithm, ".xxh")
+
+        for dest_root in self.destinations:
+            # Determine the directory where hash files should be placed
+            if self.source.is_dir():
+                hash_dir = dest_root
+            elif dest_root.is_dir():
+                hash_dir = dest_root
+            else:
+                hash_dir = dest_root.parent
+
+            # Collect (relative_path, hash, size) entries for this destination
+            entries: list[tuple[Path, str, int]] = []
+            for result in results:
+                hash_hex = result.source_hash_inflight
+                if not hash_hex:
+                    continue
+
+                for dr in result.destinations:
+                    try:
+                        rel = dr.path.relative_to(hash_dir)
+                    except ValueError:
+                        continue
+                    entries.append((rel, dr.hash_post or hash_hex, result.source_size))
+                    break
+
+            if not entries:
+                continue
+
+            if "xxh" in self.hash_file_formats:
+                path = HashFileWriter.write_xxh(
+                    entries, hash_dir / (source_name + ext), self.hash_algorithm
+                )
+                print(f"  Hash file: {path}")
+
+            if "mhl" in self.hash_file_formats:
+                path = HashFileWriter.write_mhl(
+                    entries, hash_dir, self.hash_algorithm, source_name
+                )
+                print(f"  MHL file: {path}")
+
 
 # ============================================================================
 # Main Entry Point
@@ -1309,14 +1027,6 @@ class CLIProcessor:
 
 
 def main() -> int:
-    """
-    CLI entry point.
-
-    Returns
-    -------
-    int
-        Exit code: 0 for success, 1 for failure, 130 for keyboard interrupt
-    """
     parser = argparse.ArgumentParser(
         description="Professional file copying tool with integrity verification",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1358,6 +1068,14 @@ Examples:
         help="Hash algorithm for verification (default: xxh3_64)",
     )
 
+    parser.add_argument(
+        "--hash-file",
+        type=str,
+        nargs="+",
+        choices=["xxh", "mhl"],
+        help="Generate hash file(s) at each destination (xxh: TeraCopy format, mhl: ASC MHL)",
+    )
+
     args = parser.parse_args()
 
     # Run the CLI processor
@@ -1367,6 +1085,7 @@ Examples:
             destinations=args.destinations,
             verification_mode=VerificationMode(args.mode),
             hash_algorithm=args.hash_algorithm,
+            hash_file_formats=args.hash_file or [],
         )
 
         success = processor.run()
