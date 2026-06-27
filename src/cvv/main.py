@@ -731,12 +731,14 @@ class CLIProcessor:
         verification_mode: VerificationMode,
         hash_algorithm: str,
         hash_file_formats: list[str] | None = None,
+        hash_file_dest: str = "dest",
     ):
         self.source = source
         self.destinations = destinations
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
         self.hash_file_formats = hash_file_formats or []
+        self.hash_file_dest = hash_file_dest
         self.console = Console()
 
     def run(self) -> bool:
@@ -970,45 +972,70 @@ class CLIProcessor:
             )
 
     def _generate_hash_files(self, results: list[CopyResult]) -> None:
-        """Write hash files at each destination after all copies complete."""
+        """Write hash files at source and/or destination roots."""
         source_name = self.source.stem if self.source.is_file() else self.source.name
         ext = HASH_FILE_EXTENSIONS.get(self.hash_algorithm, ".xxh")
 
-        for dest_root in self.destinations:
-            if self.source.is_dir():
-                hash_dir = dest_root
-            elif dest_root.is_dir():
-                hash_dir = dest_root
-            else:
-                hash_dir = dest_root.parent
+        dirs_to_write: list[tuple[Path, list[tuple[Path, str, int]]]] = []
 
-            entries: list[tuple[Path, str, int]] = []
-            for result in results:
-                hash_hex = result.source_hash_inflight
-                if not hash_hex:
-                    continue
-                for dr in result.destinations:
-                    try:
-                        rel = dr.path.relative_to(hash_dir)
-                    except ValueError:
-                        continue
-                    entries.append((rel, dr.hash_post or hash_hex, result.source_size))
-                    break
+        if self.hash_file_dest in ("dest", "both"):
+            for dest_root in self.destinations:
+                hash_dir = dest_root if self.source.is_dir() or dest_root.is_dir() else dest_root.parent
+                entries = self._collect_entries(results, hash_dir)
+                if entries:
+                    dirs_to_write.append((hash_dir, entries))
 
-            if not entries:
-                continue
+        if self.hash_file_dest in ("source", "both"):
+            source_dir = self.source if self.source.is_dir() else self.source.parent
+            entries = self._collect_source_entries(results, source_dir)
+            if entries:
+                dirs_to_write.append((source_dir, entries))
 
+        for hash_dir, entries in dirs_to_write:
             if "xxh" in self.hash_file_formats:
                 path = HashFileWriter.write_xxh(
                     entries, hash_dir / (source_name + ext), self.hash_algorithm
                 )
                 self.console.print(f"  [dim]Hash file:[/dim] {path}")
-
             if "mhl" in self.hash_file_formats:
                 path = HashFileWriter.write_mhl(
                     entries, hash_dir, self.hash_algorithm, source_name
                 )
                 self.console.print(f"  [dim]MHL file:[/dim] {path}")
+
+    def _collect_entries(
+        self, results: list[CopyResult], hash_dir: Path
+    ) -> list[tuple[Path, str, int]]:
+        """Collect (relative_path, hash, size) for a destination hash_dir."""
+        entries: list[tuple[Path, str, int]] = []
+        for result in results:
+            hash_hex = result.source_hash_inflight
+            if not hash_hex:
+                continue
+            for dr in result.destinations:
+                try:
+                    rel = dr.path.relative_to(hash_dir)
+                except ValueError:
+                    continue
+                entries.append((rel, dr.hash_post or hash_hex, result.source_size))
+                break
+        return entries
+
+    def _collect_source_entries(
+        self, results: list[CopyResult], source_dir: Path
+    ) -> list[tuple[Path, str, int]]:
+        """Collect (relative_path, hash, size) relative to source directory."""
+        entries: list[tuple[Path, str, int]] = []
+        for result in results:
+            hash_hex = result.source_hash_inflight
+            if not hash_hex:
+                continue
+            try:
+                rel = result.source_path.relative_to(source_dir)
+            except ValueError:
+                continue
+            entries.append((rel, hash_hex, result.source_size))
+        return entries
 
     @staticmethod
     def _format_size(n: int) -> str:
@@ -1073,7 +1100,15 @@ Examples:
         type=str,
         nargs="+",
         choices=["xxh", "mhl"],
-        help="Generate hash file(s) at each destination (xxh: TeraCopy format, mhl: ASC MHL)",
+        help="Generate hash file(s) (xxh: TeraCopy format, mhl: ASC MHL)",
+    )
+
+    parser.add_argument(
+        "--hash-file-dest",
+        type=str,
+        default="dest",
+        choices=["source", "dest", "both"],
+        help="Where to write hash files: source, dest, or both (default: dest)",
     )
 
     args = parser.parse_args()
@@ -1086,6 +1121,7 @@ Examples:
             verification_mode=VerificationMode(args.mode),
             hash_algorithm=args.hash_algorithm,
             hash_file_formats=args.hash_file or [],
+            hash_file_dest=args.hash_file_dest,
         )
 
         success = processor.run()
