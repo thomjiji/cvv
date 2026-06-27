@@ -642,6 +642,20 @@ class CopyEngine:
             message="Full verification complete",
         )
 
+    def verify(self, result: CopyResult) -> Iterator[CopyEvent | CopyResult]:
+        """Run verification on an already-copied file. Yields events and updated CopyResult."""
+        start_time = time.time()
+        try:
+            if self.verification_mode == VerificationMode.SOURCE:
+                yield from self._verify_source_only(result)
+            elif self.verification_mode == VerificationMode.FULL:
+                yield from self._verify_full(result)
+        except InterruptedError:
+            pass
+        finally:
+            result.duration += time.time() - start_time
+        yield result
+
     def _hash_file_to_completion(self, path: Path) -> str:
         final_hash = ""
         for _, final_hash in HashCalculator.hash_file(path, self.hash_algorithm):
@@ -732,6 +746,7 @@ class CLIProcessor:
         hash_algorithm: str,
         hash_file_formats: list[str] | None = None,
         hash_file_dest: str = "dest",
+        verify_deferred: bool = False,
     ):
         self.source = source
         self.destinations = destinations
@@ -739,6 +754,7 @@ class CLIProcessor:
         self.hash_algorithm = hash_algorithm
         self.hash_file_formats = hash_file_formats or []
         self.hash_file_dest = hash_file_dest
+        self.verify_deferred = verify_deferred
         self.console = Console()
 
     def run(self) -> bool:
@@ -749,23 +765,15 @@ class CLIProcessor:
             return True
 
         total_bytes = sum(f.stat().st_size for f in source_files)
+        copy_mode = VerificationMode.TRANSFER if self.verify_deferred else self.verification_mode
         results: list[CopyResult] = []
+        engines: list[CopyEngine] = []
         bytes_completed = 0
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40),
-            TaskProgressColumn(),
-            "•",
-            DownloadColumn(),
-            "•",
-            TransferSpeedColumn(),
-            "•",
-            TimeRemainingColumn(),
-            console=self.console,
-        ) as progress:
+        # Phase 1: Copy all files
+        with self._make_progress() as progress:
             overall_task = progress.add_task(
-                f"[bold]Overall [0/{len(source_files)}]",
+                f"[bold]Copying [0/{len(source_files)}]",
                 total=total_bytes,
             )
 
@@ -797,14 +805,14 @@ class CLIProcessor:
                     progress.update(
                         overall_task,
                         completed=bytes_completed,
-                        description=f"[bold]Overall [{i}/{len(source_files)}]",
+                        description=f"[bold]Copying [{i}/{len(source_files)}]",
                     )
                     continue
 
                 engine = CopyEngine(
                     source=source_file,
                     destinations=destinations_to_copy,
-                    verification_mode=self.verification_mode,
+                    verification_mode=copy_mode,
                     hash_algorithm=self.hash_algorithm,
                 )
 
@@ -844,14 +852,29 @@ class CLIProcessor:
                 progress.remove_task(file_task)
                 progress.update(
                     overall_task,
-                    description=f"[bold]Overall [{i}/{len(source_files)}]",
+                    description=f"[bold]Copying [{i}/{len(source_files)}]",
                 )
 
                 results.append(result)
+                engines.append(engine)
                 self._print_file_result(result)
 
                 if not result.success:
                     break
+
+        # Phase 2: Deferred verification
+        if self.verify_deferred and self.verification_mode != VerificationMode.TRANSFER:
+            all_copied = all(r.success for r in results)
+            if all_copied and results and not CopyEngine._shared_abort_event.is_set():
+                self.console.print(
+                    f"\n[bold]All {len(results)} file(s) copied.[/bold] "
+                    f"Verification mode: [cyan]{self.verification_mode.value}[/cyan]"
+                )
+                answer = input("Start verification? [Y/n] ").strip().lower()
+                if answer in ("", "y", "yes"):
+                    self._run_deferred_verify(results, engines)
+                else:
+                    self.console.print("[dim]Verification skipped.[/dim]")
 
         # Generate hash files
         all_success = all(r.success for r in results)
@@ -860,6 +883,79 @@ class CLIProcessor:
 
         self._show_final_summary(results)
         return all_success
+
+    def _run_deferred_verify(
+        self, results: list[CopyResult], engines: list[CopyEngine]
+    ) -> None:
+        """Run verification on all copied files."""
+        total_bytes = 0
+        verify_pairs: list[tuple[CopyEngine, CopyResult]] = []
+        for engine, result in zip(engines, results):
+            if not result.success:
+                continue
+            engine.verification_mode = self.verification_mode
+            result.verification_mode = self.verification_mode
+            if self.verification_mode == VerificationMode.SOURCE:
+                total_bytes += result.source_size
+            elif self.verification_mode == VerificationMode.FULL:
+                total_bytes += result.source_size * (1 + len(result.destinations))
+            verify_pairs.append((engine, result))
+
+        with self._make_progress() as progress:
+            overall_task = progress.add_task(
+                f"[bold]Verifying [0/{len(verify_pairs)}]", total=total_bytes
+            )
+            bytes_completed = 0
+
+            for i, (engine, result) in enumerate(verify_pairs, 1):
+                if CopyEngine._shared_abort_event.is_set():
+                    break
+
+                file_task = progress.add_task(
+                    f"Verifying {result.source_path.name}",
+                    total=result.source_size,
+                )
+
+                for event in engine.verify(result):
+                    if isinstance(event, CopyResult):
+                        break
+                    elif event.type == EventType.VERIFY_START:
+                        progress.reset(file_task, total=event.total_bytes)
+                    elif event.type == EventType.VERIFY_PROGRESS:
+                        progress.update(
+                            file_task, completed=event.bytes_processed
+                        )
+                        progress.update(
+                            overall_task,
+                            completed=bytes_completed + event.bytes_processed,
+                        )
+
+                if self.verification_mode == VerificationMode.SOURCE:
+                    bytes_completed += result.source_size
+                elif self.verification_mode == VerificationMode.FULL:
+                    bytes_completed += result.source_size * (1 + len(result.destinations))
+
+                progress.remove_task(file_task)
+                progress.update(
+                    overall_task,
+                    completed=bytes_completed,
+                    description=f"[bold]Verifying [{i}/{len(verify_pairs)}]",
+                )
+                self._print_file_result(result)
+
+    def _make_progress(self) -> Progress:
+        return Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            "•",
+            DownloadColumn(),
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeRemainingColumn(),
+            console=self.console,
+        )
 
     def _discover_files(self) -> list[Path]:
         if self.source.is_file():
@@ -1111,6 +1207,12 @@ Examples:
         help="Where to write hash files: source, dest, or both (default: dest)",
     )
 
+    parser.add_argument(
+        "--verify-after",
+        action="store_true",
+        help="Defer verification until all files are copied, then prompt",
+    )
+
     args = parser.parse_args()
 
     # Run the CLI processor
@@ -1122,6 +1224,7 @@ Examples:
             hash_algorithm=args.hash_algorithm,
             hash_file_formats=args.hash_file or [],
             hash_file_dest=args.hash_file_dest,
+            verify_deferred=args.verify_after,
         )
 
         success = processor.run()
