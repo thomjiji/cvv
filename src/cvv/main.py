@@ -30,6 +30,17 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+
 try:
     import xxhash
 except ImportError:
@@ -726,44 +737,126 @@ class CLIProcessor:
         self.verification_mode = verification_mode
         self.hash_algorithm = hash_algorithm
         self.hash_file_formats = hash_file_formats or []
+        self.console = Console()
 
     def run(self) -> bool:
         """Execute copy jobs for all source files."""
-        # Discover files to copy
         source_files = self._discover_files()
-
         if not source_files:
-            print("No files to copy")
+            self.console.print("No files to copy")
             return True
 
-        # Execute each copy job
-        results = []
-        for i, source_file in enumerate(source_files, 1):
-            # Check if user pressed Ctrl+C (before starting next file)
-            if CopyEngine._shared_abort_event.is_set():
-                break
+        total_bytes = sum(f.stat().st_size for f in source_files)
+        results: list[CopyResult] = []
+        bytes_completed = 0
 
-            print(f"\nFile {i}/{len(source_files)}: {source_file.name}")
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            "•",
+            DownloadColumn(),
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeRemainingColumn(),
+            console=self.console,
+        ) as progress:
+            overall_task = progress.add_task(
+                f"[bold]Overall [0/{len(source_files)}]",
+                total=total_bytes,
+            )
 
-            dest_paths = self._calculate_destinations(source_file)
-            result = self._execute_single_copy(source_file, dest_paths)
-            results.append(result)
+            for i, source_file in enumerate(source_files, 1):
+                if CopyEngine._shared_abort_event.is_set():
+                    break
 
-            # Show result summary
-            self._show_result_summary(result)
+                file_size = source_file.stat().st_size
+                dest_paths = self._calculate_destinations(source_file)
+                destinations_to_copy = self._check_duplicates_and_cleanup(
+                    source_file, dest_paths
+                )
 
-            if not result.success:
-                print("Operation failed, stopping.")
-                break
+                if not destinations_to_copy:
+                    self.console.print(
+                        f"[dim]⊘ {source_file.name} (already exists)[/dim]"
+                    )
+                    result = CopyResult(
+                        source_path=source_file,
+                        source_size=file_size,
+                        verification_mode=self.verification_mode,
+                    )
+                    for dest in dest_paths:
+                        result.destinations.append(
+                            DestinationResult(path=dest, success=True)
+                        )
+                    results.append(result)
+                    bytes_completed += file_size
+                    progress.update(
+                        overall_task,
+                        completed=bytes_completed,
+                        description=f"[bold]Overall [{i}/{len(source_files)}]",
+                    )
+                    continue
+
+                engine = CopyEngine(
+                    source=source_file,
+                    destinations=destinations_to_copy,
+                    verification_mode=self.verification_mode,
+                    hash_algorithm=self.hash_algorithm,
+                )
+
+                file_task = progress.add_task(
+                    f"Copying {source_file.name}", total=file_size
+                )
+
+                result = None
+                for event in engine.copy():
+                    if isinstance(event, CopyResult):
+                        result = event
+                        break
+                    elif event.type == EventType.COPY_PROGRESS:
+                        progress.update(
+                            file_task, completed=event.bytes_processed
+                        )
+                        progress.update(
+                            overall_task,
+                            completed=bytes_completed + event.bytes_processed,
+                        )
+                    elif event.type == EventType.COPY_COMPLETE:
+                        bytes_completed += file_size
+                        progress.update(
+                            overall_task, completed=bytes_completed
+                        )
+                    elif event.type == EventType.VERIFY_START:
+                        progress.reset(
+                            file_task,
+                            total=event.total_bytes,
+                            description=f"Verifying {source_file.name}",
+                        )
+                    elif event.type == EventType.VERIFY_PROGRESS:
+                        progress.update(
+                            file_task, completed=event.bytes_processed
+                        )
+
+                progress.remove_task(file_task)
+                progress.update(
+                    overall_task,
+                    description=f"[bold]Overall [{i}/{len(source_files)}]",
+                )
+
+                results.append(result)
+                self._print_file_result(result)
+
+                if not result.success:
+                    break
 
         # Generate hash files
         all_success = all(r.success for r in results)
         if self.hash_file_formats and all_success and results:
             self._generate_hash_files(results)
 
-        # Final summary
         self._show_final_summary(results)
-
         return all_success
 
     def _discover_files(self) -> list[Path]:
@@ -775,20 +868,16 @@ class CLIProcessor:
             raise FileNotFoundError(f"Source not found: {self.source}")
 
     def _calculate_destinations(self, source_file: Path) -> list[Path]:
-        dest_paths = []
-
-        # If source is a directory, preserve structure
         if self.source.is_dir():
             relative_path = source_file.relative_to(self.source)
             return [dest_root / relative_path for dest_root in self.destinations]
 
-        # Single file source
+        dest_paths = []
         for dest in self.destinations:
             if dest.is_dir():
                 dest_paths.append(dest / source_file.name)
             else:
                 dest_paths.append(dest)
-
         return dest_paths
 
     def _check_duplicates_and_cleanup(
@@ -799,28 +888,26 @@ class CLIProcessor:
         destinations_to_copy = []
 
         for dest in destinations:
-            # Priority 1: Check if destination file already exists and is complete
             if dest.exists():
                 dest_size = dest.stat().st_size
                 if dest_size == source_size:
-                    print(f"  ✓ {dest.name} already exists (skipping)")
+                    self.console.print(
+                        f"  [green]✓[/green] {dest.name} already exists [dim](skipping)[/dim]"
+                    )
                     continue
                 else:
-                    print(
-                        f"  ! {dest.name} exists but wrong size "
+                    self.console.print(
+                        f"  [yellow]![/yellow] {dest.name} wrong size "
                         f"({dest_size} vs {source_size}), will overwrite"
                     )
                     dest.unlink()
 
-            # Priority 2: Check for incomplete .tmp file - just delete it and restart
             tmp_path = dest.with_suffix(dest.suffix + ".tmp")
             if tmp_path.exists():
                 tmp_size = tmp_path.stat().st_size
-                mb_done = tmp_size / (1024 * 1024)
-                source_mb = source_size / (1024 * 1024)
-                print(
-                    f"  ! Found incomplete {tmp_path.name} "
-                    f"({mb_done:.1f}/{source_mb:.1f} MB), restarting from beginning"
+                self.console.print(
+                    f"  [yellow]![/yellow] Found incomplete {tmp_path.name} "
+                    f"({tmp_size / (1024 * 1024):.1f}/{source_size / (1024 * 1024):.1f} MB), restarting"
                 )
                 tmp_path.unlink()
 
@@ -828,153 +915,59 @@ class CLIProcessor:
 
         return destinations_to_copy
 
-    def _execute_single_copy(
-        self, source: Path, destinations: list[Path]
-    ) -> CopyResult:
-        # Check for duplicates and cleanup incomplete .tmp files
-        destinations_to_copy = self._check_duplicates_and_cleanup(source, destinations)
+    def _print_file_result(self, result: CopyResult) -> None:
+        name = result.source_path.name
+        size = self._format_size(result.source_size)
+        speed = f"{result.speed_mb_sec:.1f} MB/s"
 
-        # If all destinations already exist, return success result
-        if not destinations_to_copy:
-            print("  ✓ All destinations already complete (nothing to copy)")
-            result = CopyResult(
-                source_path=source,
-                source_size=source.stat().st_size,
-                verification_mode=self.verification_mode,
+        if not result.success:
+            errors = [dr.error for dr in result.destinations if dr.error]
+            self.console.print(
+                f"[red]✗[/red] {name}  [red]{errors[0] if errors else 'Failed'}[/red]"
             )
-            # Create success results for all destinations
-            for dest in destinations:
-                result.destinations.append(DestinationResult(path=dest, success=True))
-            return result
+            return
 
-        engine = CopyEngine(
-            source=source,
-            destinations=destinations_to_copy,
-            verification_mode=self.verification_mode,
-            hash_algorithm=self.hash_algorithm,
-        )
+        parts = [f"[green]✓[/green] {name}", f"[dim]{size}[/dim]", f"[dim]{speed}[/dim]"]
 
-        result = None
-        copy_total = 0
-        verify_total = 0
+        if result.source_hash_inflight:
+            parts.append(f"[cyan]{result.source_hash_inflight}[/cyan]")
 
-        for event in engine.copy():
-            if isinstance(event, CopyResult):
-                result = event
-                sys.stdout.write("\n")  # Newline after progress
-                sys.stdout.flush()
-                break
+        if result.source_hash_post:
+            ok = result.source_hash_post == result.source_hash_inflight
+            parts.append(f"[{'green' if ok else 'red'}]src {'✓' if ok else '✗'}[/]")
 
-            elif event.type == EventType.COPY_START:
-                copy_total = event.total_bytes
-
-            elif event.type == EventType.COPY_PROGRESS:
-                percent = (
-                    (event.bytes_processed / copy_total * 100) if copy_total else 0
-                )
-                mb_done = event.bytes_processed / (1024 * 1024)
-                mb_total = copy_total / (1024 * 1024)
-                # Clear line and write progress
-                sys.stdout.write(
-                    f"\rCopying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
-                        80
-                    )
-                )
-                sys.stdout.flush()
-
-            elif event.type == EventType.VERIFY_START:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                verify_total = event.total_bytes
-
-            elif event.type == EventType.VERIFY_PROGRESS:
-                percent = (
-                    (event.bytes_processed / verify_total * 100) if verify_total else 0
-                )
-                mb_done = event.bytes_processed / (1024 * 1024)
-                mb_total = verify_total / (1024 * 1024)
-                # Clear line and write progress
-                sys.stdout.write(
-                    f"\rVerifying: {percent:.1f}% ({mb_done:.1f}/{mb_total:.1f} MB)".ljust(
-                        80
-                    )
-                )
-                sys.stdout.flush()
-
-        return result
-
-    def _show_result_summary(self, result: CopyResult) -> None:
-        if result.success:
-            print(
-                f"✓ Success "
-                f"({result.speed_mb_sec:.2f} MB/s, "
-                f"{result.source_size / (1024 * 1024):.2f} MB)"
-            )
-
-            # Display hash information based on verification mode
-            if result.verification_mode == VerificationMode.TRANSFER:
-                # TRANSFER: Show in-flight hash
-                if result.source_hash_inflight:
-                    print(
-                        f"  Source hash ({self.hash_algorithm}): {result.source_hash_inflight}"
+        if result.verification_mode == VerificationMode.FULL:
+            for dr in result.destinations:
+                if dr.hash_post:
+                    ok = dr.hash_post == result.source_hash_inflight
+                    parts.append(
+                        f"[{'green' if ok else 'red'}]dst {'✓' if ok else '✗'}[/]"
                     )
 
-            elif result.verification_mode == VerificationMode.SOURCE:
-                # SOURCE: Show both in-flight and post-copy hashes
-                if result.source_hash_inflight:
-                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
-                if result.source_hash_post:
-                    match_indicator = (
-                        "✓"
-                        if result.source_hash_post == result.source_hash_inflight
-                        else "✗"
-                    )
-                    print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
-
-            elif result.verification_mode == VerificationMode.FULL:
-                # FULL: Show source hashes and all destination hashes
-                if result.source_hash_inflight:
-                    print(f"  Source hash (in-flight):  {result.source_hash_inflight}")
-                if result.source_hash_post:
-                    match_indicator = (
-                        "✓"
-                        if result.source_hash_post == result.source_hash_inflight
-                        else "✗"
-                    )
-                    print(
-                        f"  Source hash (post-copy):  {result.source_hash_post} [{match_indicator}]"
-                    )
-
-                # Show each destination hash
-                for dest_result in result.destinations:
-                    if dest_result.hash_post:
-                        match_indicator = (
-                            "✓"
-                            if dest_result.hash_post == result.source_hash_inflight
-                            else "✗"
-                        )
-                        print(
-                            f"  {dest_result.path.name}: {dest_result.hash_post} [{match_indicator}]"
-                        )
-        else:
-            print("✗ Failed")
-            for dest_result in result.destinations:
-                if not dest_result.success:
-                    print(f"  ✗ {dest_result.path.name}: {dest_result.error}")
+        self.console.print("  ".join(parts))
 
     def _show_final_summary(self, results: list[CopyResult]) -> None:
-        print("\n" + "=" * 60)
-
         total = len(results)
         success = sum(1 for r in results if r.success)
         failed = total - success
+        total_size = sum(r.source_size for r in results)
+        total_duration = sum(r.duration for r in results)
 
+        self.console.print()
         if failed == 0:
-            print(f"All {total} operation(s) completed successfully")
+            avg_speed = (
+                f"{(total_size / (1024 ** 2)) / total_duration:.1f} MB/s"
+                if total_duration > 0
+                else ""
+            )
+            self.console.print(
+                f"[bold green]All {total} file(s) completed[/bold green]  "
+                f"[dim]{self._format_size(total_size)}  {avg_speed}[/dim]"
+            )
         else:
-            print(f"{failed} of {total} operation(s) failed")
+            self.console.print(
+                f"[bold red]{failed} of {total} file(s) failed[/bold red]"
+            )
 
     def _generate_hash_files(self, results: list[CopyResult]) -> None:
         """Write hash files at each destination after all copies complete."""
@@ -982,7 +975,6 @@ class CLIProcessor:
         ext = HASH_FILE_EXTENSIONS.get(self.hash_algorithm, ".xxh")
 
         for dest_root in self.destinations:
-            # Determine the directory where hash files should be placed
             if self.source.is_dir():
                 hash_dir = dest_root
             elif dest_root.is_dir():
@@ -990,13 +982,11 @@ class CLIProcessor:
             else:
                 hash_dir = dest_root.parent
 
-            # Collect (relative_path, hash, size) entries for this destination
             entries: list[tuple[Path, str, int]] = []
             for result in results:
                 hash_hex = result.source_hash_inflight
                 if not hash_hex:
                     continue
-
                 for dr in result.destinations:
                     try:
                         rel = dr.path.relative_to(hash_dir)
@@ -1012,13 +1002,23 @@ class CLIProcessor:
                 path = HashFileWriter.write_xxh(
                     entries, hash_dir / (source_name + ext), self.hash_algorithm
                 )
-                print(f"  Hash file: {path}")
+                self.console.print(f"  [dim]Hash file:[/dim] {path}")
 
             if "mhl" in self.hash_file_formats:
                 path = HashFileWriter.write_mhl(
                     entries, hash_dir, self.hash_algorithm, source_name
                 )
-                print(f"  MHL file: {path}")
+                self.console.print(f"  [dim]MHL file:[/dim] {path}")
+
+    @staticmethod
+    def _format_size(n: int) -> str:
+        if n >= 1024**3:
+            return f"{n / 1024 ** 3:.1f} GB"
+        if n >= 1024**2:
+            return f"{n / 1024 ** 2:.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n} B"
 
 
 # ============================================================================
