@@ -81,7 +81,7 @@ class CLIProcessor:
 
                 if not destinations_to_copy:
                     self.console.print(
-                        f"[dim]⊘ {source_file.name} (already exists)[/dim]"
+                        f"[dim]- {source_file.name} (already exists)[/dim]"
                     )
                     result = CopyResult(
                         source_path=source_file,
@@ -246,11 +246,11 @@ class CLIProcessor:
             TextColumn("[progress.description]{task.description}"),
             BarColumn(bar_width=40),
             TaskProgressColumn(),
-            "•",
+            "|",
             DownloadColumn(),
-            "•",
+            "|",
             TransferSpeedColumn(),
-            "•",
+            "|",
             TimeRemainingColumn(),
             console=self.console,
         )
@@ -288,7 +288,7 @@ class CLIProcessor:
                 dest_size = dest.stat().st_size
                 if dest_size == source_size:
                     self.console.print(
-                        f"  [green]✓[/green] {dest.name} already exists [dim](skipping)[/dim]"
+                        f"  [green]OK[/green] {dest.name} already exists [dim](skipping)[/dim]"
                     )
                     continue
                 else:
@@ -319,25 +319,25 @@ class CLIProcessor:
         if not result.success:
             errors = [dr.error for dr in result.destinations if dr.error]
             self.console.print(
-                f"[red]✗[/red] {name}  [red]{errors[0] if errors else 'Failed'}[/red]"
+                f"[red]FAIL[/red] {name}  [red]{errors[0] if errors else 'Failed'}[/red]"
             )
             return
 
-        parts = [f"[green]✓[/green] {name}", f"[dim]{size}[/dim]", f"[dim]{speed}[/dim]"]
+        parts = [f"[green]OK[/green] {name}", f"[dim]{size}[/dim]", f"[dim]{speed}[/dim]"]
 
         if result.source_hash_inflight:
             parts.append(f"[cyan]{result.source_hash_inflight}[/cyan]")
 
         if result.source_hash_post:
             ok = result.source_hash_post == result.source_hash_inflight
-            parts.append(f"[{'green' if ok else 'red'}]src {'✓' if ok else '✗'}[/]")
+            parts.append(f"[{'green' if ok else 'red'}]src {'OK' if ok else 'FAIL'}[/]")
 
         if result.verification_mode == VerificationMode.FULL:
             for dr in result.destinations:
                 if dr.hash_post:
                     ok = dr.hash_post == result.source_hash_inflight
                     parts.append(
-                        f"[{'green' if ok else 'red'}]dst {'✓' if ok else '✗'}[/]"
+                        f"[{'green' if ok else 'red'}]dst {'OK' if ok else 'FAIL'}[/]"
                     )
 
         self.console.print("  ".join(parts))
