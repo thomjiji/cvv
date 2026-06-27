@@ -211,10 +211,11 @@ class TestCopyEngine(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertFalse(result.success)
         self.assertFalse(result.destinations[0].success)
-        # Error message should mention the file or directory issue
         error_msg = result.destinations[0].error.lower()
         self.assertTrue(
-            "no such file" in error_msg or "not found" in error_msg,
+            "no such file" in error_msg
+            or "not found" in error_msg
+            or "cannot find" in error_msg,
             f"Expected file not found error, got: {result.destinations[0].error}",
         )
 
@@ -402,7 +403,11 @@ class TestErrorHandling(unittest.TestCase):
     def test_per_destination_errors(self) -> None:
         """Test that errors are tracked per destination."""
         dest1 = self.test_path / "dest1.txt"  # Good destination
-        dest2 = Path("/nonexistent/path/dest2.txt")  # Bad destination
+        # Use an invalid path that can't be created on any OS
+        if sys.platform == "win32":
+            dest2 = Path("Z:\\__no_such_drive__\\dest2.txt")
+        else:
+            dest2 = Path("/nonexistent/path/dest2.txt")
 
         engine = CopyEngine(
             source=self.source_file,
@@ -415,7 +420,6 @@ class TestErrorHandling(unittest.TestCase):
                 result = event
 
         self.assertIsNotNone(result)
-        # Overall operation failed because one destination failed
         self.assertFalse(result.success)
 
 
