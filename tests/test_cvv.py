@@ -710,7 +710,7 @@ class TestHashFileIntegration(unittest.TestCase):
         success = processor.run()
         self.assertTrue(success)
 
-        xxh_file = self.dest / "source.xxh"
+        xxh_file = self.dest / "source.xxh3"
         self.assertTrue(xxh_file.exists(), f"{xxh_file} should be generated")
 
         content = xxh_file.read_text(encoding="utf-8")
@@ -748,7 +748,7 @@ class TestHashFileIntegration(unittest.TestCase):
         success = processor.run()
         self.assertTrue(success)
 
-        self.assertTrue((self.dest / "source.xxh").exists())
+        self.assertTrue((self.dest / "source.xxh3").exists())
         self.assertTrue((self.dest / "ascmhl").exists())
 
     def test_no_hash_file_without_flag(self) -> None:
@@ -763,7 +763,7 @@ class TestHashFileIntegration(unittest.TestCase):
         success = processor.run()
         self.assertTrue(success)
 
-        self.assertFalse((self.dest / "source.xxh").exists())
+        self.assertFalse((self.dest / "source.xxh3").exists())
         self.assertFalse((self.dest / "ascmhl").exists())
 
 

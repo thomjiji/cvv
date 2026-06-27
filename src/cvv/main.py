@@ -53,7 +53,7 @@ BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
 QUEUE_SIZE = 10  # Max chunks buffered per destination
 
 HASH_FILE_EXTENSIONS = {
-    "xxh3_64": ".xxh",
+    "xxh3_64": ".xxh3",
     "xxh64": ".xxh",
     "md5": ".md5",
     "sha1": ".sha1",
