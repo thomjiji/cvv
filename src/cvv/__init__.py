@@ -1,28 +1,17 @@
-"""
-cvv: Professional file copying tools for DIT workflows.
+"""cvv: Professional file copying tools for DIT workflows."""
 
-This package implements professional-grade file copying utilities inspired by
-Offload Manager, providing reliable file transfer with integrity verification,
-progress monitoring, and multi-destination support.
-"""
-
-from .main import (
-    CLIProcessor,
-    CopyEngine,
+from .cli import CLIProcessor, main
+from .engine import CopyEngine, HashCalculator
+from .hash_file import HashFileWriter
+from .models import (
     CopyEvent,
     CopyResult,
     DestinationResult,
     EventType,
-    HashCalculator,
-    HashFileWriter,
     VerificationMode,
-    main,
 )
 
-__version__ = "1.0.0"
-__author__ = "thomjiji"
-__description__ = "Professional file copying tools for DIT workflows"
-
+__version__ = "0.0.1"
 __all__ = [
     "CLIProcessor",
     "CopyEngine",

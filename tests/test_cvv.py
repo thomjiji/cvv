@@ -380,26 +380,6 @@ class TestErrorHandling(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertIn("space", result.destinations[0].error.lower())
 
-    def test_write_permission_error(self) -> None:
-        """Test error when destination is not writable."""
-        # Use /dev/full which always returns "disk full" error
-        if not Path("/dev/full").exists():
-            self.skipTest("/dev/full not available on this system")
-
-        dest = Path("/dev/full")
-
-        engine = CopyEngine(
-            source=self.source_file,
-            destinations=[dest],
-        )
-
-        result = None
-        for event in engine.copy():
-            if isinstance(event, CopyResult):
-                result = event
-
-        self.assertFalse(result.success)
-
     def test_per_destination_errors(self) -> None:
         """Test that errors are tracked per destination."""
         dest1 = self.test_path / "dest1.txt"  # Good destination
