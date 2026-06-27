@@ -210,13 +210,15 @@ class HashCalculator:
 
     Parameters
     ----------
-    algorithm : str, default="xxh64be"
-        Hash algorithm to use. Supported: xxh64be, md5, sha1, sha256
+    algorithm : str, default="xxh3_64"
+        Hash algorithm to use. Supported: xxh3_64, xxh64, md5, sha1, sha256
     """
 
-    def __init__(self, algorithm: str = "xxh64be"):
+    def __init__(self, algorithm: str = "xxh3_64"):
         self.algorithm = algorithm.lower()
-        if self.algorithm == "xxh64be":
+        if self.algorithm == "xxh3_64":
+            self._hasher = xxhash.xxh3_64()
+        elif self.algorithm == "xxh64":
             self._hasher = xxhash.xxh64()
         elif self.algorithm in ["md5", "sha1", "sha256"]:
             self._hasher = hashlib.new(self.algorithm)
@@ -248,7 +250,7 @@ class HashCalculator:
     @staticmethod
     def hash_file(
         path: Path,
-        algorithm: str = "xxh64be",
+        algorithm: str = "xxh3_64",
         abort_event: threading.Event | None = None,
     ) -> Iterator[tuple[int, str]]:
         """
@@ -258,7 +260,7 @@ class HashCalculator:
         ----------
         path : Path
             Path to file to hash
-        algorithm : str, default="xxh64be"
+        algorithm : str, default="xxh3_64"
             Hash algorithm to use
         abort_event : threading.Event | None, default=None
             Event to check for abort signal
@@ -304,7 +306,7 @@ class CopyEngine:
         List of destination file paths
     verification_mode : VerificationMode, default=VerificationMode.FULL
         Verification strategy to use
-    hash_algorithm : str, default="xxh64be"
+    hash_algorithm : str, default="xxh3_64"
         Hash algorithm for verification
     abort_event : threading.Event | None, default=None
         Optional custom abort event (uses shared event if None)
@@ -319,7 +321,7 @@ class CopyEngine:
         source: Path,
         destinations: list[Path],
         verification_mode: VerificationMode = VerificationMode.FULL,
-        hash_algorithm: str = "xxh64be",
+        hash_algorithm: str = "xxh3_64",
         abort_event: threading.Event | None = None,
     ):
         self.source = source
@@ -1351,9 +1353,9 @@ Examples:
     parser.add_argument(
         "--hash-algorithm",
         type=str,
-        default="xxh64be",
-        choices=["xxh64be", "md5", "sha1", "sha256"],
-        help="Hash algorithm for verification (default: xxh64be)",
+        default="xxh3_64",
+        choices=["xxh3_64", "xxh64", "md5", "sha1", "sha256"],
+        help="Hash algorithm for verification (default: xxh3_64)",
     )
 
     args = parser.parse_args()

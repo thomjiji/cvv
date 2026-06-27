@@ -76,8 +76,8 @@ class TestHashCalculator(unittest.TestCase):
         expected = hashlib.sha256(test_data).hexdigest()
         self.assertEqual(final_hash, expected)
 
-    def test_hash_file_generator_xxh64be(self) -> None:
-        """Test xxHash calculation via generator."""
+    def test_hash_file_generator_xxh3_64(self) -> None:
+        """Test xxHash3 calculation via generator."""
         test_file = self.test_path / "test.txt"
         test_data = b"xxHash test data"
         test_file.write_bytes(test_data)
@@ -86,7 +86,7 @@ class TestHashCalculator(unittest.TestCase):
         final_hash = ""
         bytes_processed = 0
         for bytes_processed, final_hash in HashCalculator.hash_file(
-            test_file, "xxh64be"
+            test_file, "xxh3_64"
         ):
             pass  # Process all yields
 
@@ -456,7 +456,7 @@ class TestCLIProcessor(unittest.TestCase):
             source=source_file,
             destinations=[self.dest1, self.dest2],
             verification_mode=VerificationMode.TRANSFER,
-            hash_algorithm="xxh64be",
+            hash_algorithm="xxh3_64",
         )
 
         success = processor.run()
@@ -473,7 +473,7 @@ class TestCLIProcessor(unittest.TestCase):
             source=self.source_dir,
             destinations=[self.dest1, self.dest2],
             verification_mode=VerificationMode.TRANSFER,
-            hash_algorithm="xxh64be",
+            hash_algorithm="xxh3_64",
         )
 
         success = processor.run()
@@ -497,7 +497,7 @@ class TestCLIProcessor(unittest.TestCase):
             source=self.source_dir,
             destinations=[self.dest1],
             verification_mode=VerificationMode.TRANSFER,
-            hash_algorithm="xxh64be",
+            hash_algorithm="xxh3_64",
         )
 
         files = processor._discover_files()
@@ -515,7 +515,7 @@ class TestCLIProcessor(unittest.TestCase):
             source=source_file,
             destinations=[self.dest1],
             verification_mode=VerificationMode.TRANSFER,
-            hash_algorithm="xxh64be",
+            hash_algorithm="xxh3_64",
         )
 
         files = processor._discover_files()
@@ -563,7 +563,7 @@ class TestIntegration(unittest.TestCase):
             source=source_dir,
             destinations=[dest1, dest2],
             verification_mode=VerificationMode.FULL,
-            hash_algorithm="xxh64be",
+            hash_algorithm="xxh3_64",
         )
 
         success = processor.run()
