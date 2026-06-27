@@ -312,6 +312,7 @@ class CopyEngine:
 
             if not self._abort_event.is_set():
                 temp_path.replace(dest_path)
+                shutil.copystat(self.source, dest_path)
 
         except Exception as e:
             error_dict[dest_path] = str(e)
