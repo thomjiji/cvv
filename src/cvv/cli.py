@@ -93,6 +93,12 @@ class CLIProcessor:
                             DestinationResult(path=dest, success=True)
                         )
                     results.append(result)
+                    engines.append(CopyEngine(
+                        source=source_file,
+                        destinations=dest_paths,
+                        verification_mode=self.verification_mode,
+                        hash_algorithm=self.hash_algorithm,
+                    ))
                     bytes_completed += file_size
                     progress.update(
                         overall_task,
